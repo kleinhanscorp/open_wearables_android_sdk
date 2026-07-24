@@ -456,10 +456,16 @@ class OpenWearablesHealthSDK private constructor(
     /**
      * Sets the log level. Convenience wrapper mirroring the iOS API, intended
      * for cross-platform bridges (React Native, Flutter) and Java callers.
+     * 
+     * NOTE: This explicit function was commented out to resolve a Kotlin Platform
+     * Declaration Clash in the JVM bytecode. The `var logLevel` property on line 83
+     * automatically generates a `public void setLogLevel(OWLogLevel level)` method
+     * for Java interop, making this explicit function redundant and causing a build failure.
+     * Java/React Native callers can still use `setLogLevel()` seamlessly.
      */
-    fun setLogLevel(level: OWLogLevel) {
-        this.logLevel = level
-    }
+    // fun setLogLevel(level: OWLogLevel) {
+    //     this.logLevel = level
+    // }
 
     internal fun logMessage(message: String) {
         when (logLevel) {

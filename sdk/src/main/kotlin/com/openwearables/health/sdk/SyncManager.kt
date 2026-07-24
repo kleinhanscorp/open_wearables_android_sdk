@@ -623,20 +623,29 @@ class SyncManager(
     }
 
     /**
-     * Creates an OkHttp RequestBody that streams JSON directly from the Map
-     * to the network via android.util.JsonWriter. No intermediate JsonElement
-     * tree or full String is allocated — only the writer's small internal buffer
-     * is held in heap, making memory usage O(depth) instead of O(n).
+     * Creates an OkHttp RequestBody with the JSON payload fully buffered so a
+     * concrete Content-Length is sent. Chunked transfer encoding (the previous
+     * streaming approach) is rejected by the OpenLiteSpeed proxy in front of
+     * the OW backend; the buffer also lets OkHttp transparently retry the body.
+     * JsonWriter is still used for serialization to avoid an intermediate
+     * JsonElement tree.
      */
     private fun streamingJsonBody(payload: Map<String, Any>): RequestBody {
+        val baos = java.io.ByteArrayOutputStream()
+        val writer = android.util.JsonWriter(
+            java.io.OutputStreamWriter(baos, Charsets.UTF_8)
+        )
+        writeValue(writer, payload)
+        writer.flush()
+        writer.close()
+        
+        val bytes = baos.toByteArray()
+        
         return object : okhttp3.RequestBody() {
             override fun contentType() = "application/json".toMediaType()
+            override fun contentLength(): Long = bytes.size.toLong()
             override fun writeTo(sink: okio.BufferedSink) {
-                val writer = android.util.JsonWriter(
-                    java.io.OutputStreamWriter(sink.outputStream(), Charsets.UTF_8)
-                )
-                writeValue(writer, payload)
-                writer.flush()
+                sink.write(bytes)
             }
         }
     }
