@@ -80,7 +80,7 @@ afterEvaluate {
                 from(components["release"])
                 groupId = "com.openwearables.health"
                 artifactId = "sdk"
-                version = "0.11.1"
+                version = "0.11.2"
 
                 pom {
                     name.set("Open Wearables Health SDK")
