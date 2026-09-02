@@ -79,11 +79,30 @@ class OpenWearablesHealthSDK private constructor(
     var logListener: ((String) -> Unit)? = null
     var authErrorListener: ((statusCode: Int, message: String) -> Unit)? = null
 
+    /** Gutsy fork: the persisted auth verdict changed ("ok" / "recovering" / "reauth_required"). */
+    var authStateListener: ((state: String) -> Unit)? = null
+
+    /** Gutsy fork: a broken session was repaired natively ("renewal" / "double-check" / "external"). */
+    var authRecoveredListener: ((via: String) -> Unit)? = null
+
     /// Current log level. Default is DEBUG (logs only in debuggable builds).
     var logLevel: OWLogLevel = OWLogLevel.DEBUG
 
     // Components
     internal val secureStorage: SecureStorage by lazy { SecureStorage(context) }
+
+    // Gutsy fork — the auth self-healing ladder, shared by every SyncManager this instance builds.
+    // Listeners are resolved at call time so a bridge that sets them after init still hears them.
+    private val authRecovery: AuthRecovery by lazy {
+        AuthRecovery(
+            secureStorage,
+            SyncManager.sharedHttpClient,
+            ::logMessage,
+            { state -> authStateListener?.invoke(state) },
+            { via -> authRecoveredListener?.invoke(via) },
+            dispatchers.io
+        )
+    }
 
     private val samsungHealthManager: SamsungHealthManager by lazy {
         samsungHealthManagerFactory?.invoke(context, activityRef?.get(), dispatchers, ::logMessage)
@@ -194,6 +213,10 @@ class OpenWearablesHealthSDK private constructor(
         sm.clearSyncSession()
         sm.resetAnchors()
 
+        // A fresh sign-in supersedes any renewal credential and any prior verdict.
+        secureStorage.clearRenewalCredential()
+        secureStorage.clearAuthLedger()
+
         secureStorage.saveCredentials(userId, accessToken, refreshToken)
         if (apiKey != null) {
             secureStorage.saveApiKey(apiKey)
@@ -205,6 +228,8 @@ class OpenWearablesHealthSDK private constructor(
 
     suspend fun signOut() {
         logMessage("Signing out")
+        // Before storage is wiped: tell the server this refresh token is done (fire-and-forget).
+        authRecovery.revokeRefreshTokenBestEffort()
         val sm = ensureSyncManager()
         sm.stopBackgroundSync()
         sm.resetAnchors()
@@ -230,9 +255,12 @@ class OpenWearablesHealthSDK private constructor(
 
     fun isSyncActive(): Boolean = secureStorage.isSyncActive()
 
+    /** Gutsy fork: also lifts any `recovering` / `reauth_required` verdict — the host has repaired us. */
     fun updateTokens(accessToken: String, refreshToken: String?) {
-        secureStorage.updateTokens(accessToken, refreshToken)
-        logMessage("Tokens updated")
+        val persisted = secureStorage.updateTokens(accessToken, refreshToken)
+        logMessage(if (persisted) "Tokens updated" else "Tokens updated but storage verification failed")
+        secureStorage.setRenewalFailures(0)
+        authRecovery.markAuthOk("external")
         ensureSyncManager().retryOutboxIfPossible()
     }
 
@@ -244,8 +272,41 @@ class OpenWearablesHealthSDK private constructor(
         "host" to secureStorage.getHost(),
         "customSyncUrl" to secureStorage.getCustomSyncUrl(),
         "isSyncActive" to secureStorage.isSyncActive(),
-        "provider" to (activeProvider?.providerId ?: secureStorage.getProvider())
+        "provider" to (activeProvider?.providerId ?: secureStorage.getProvider()),
+        "authState" to secureStorage.getAuthState(),
+        "hasRenewalCredential" to secureStorage.hasRenewalCredential()
     )
+
+    // -----------------------------------------------------------------------
+    // Auth self-healing (Gutsy fork — see AuthRecovery.kt)
+    // -----------------------------------------------------------------------
+
+    /**
+     * Install the long-lived renewal credential the SDK exchanges for a fresh token pair when its
+     * refresh token is rejected. Replaces any previous credential; lifts a `reauth_required` verdict.
+     */
+    fun setRenewalCredential(url: String, token: String) = authRecovery.setRenewalCredential(url, token)
+
+    fun clearRenewalCredential() = authRecovery.clearRenewalCredential()
+
+    fun hasRenewalCredential(): Boolean = secureStorage.hasRenewalCredential()
+
+    /** Persisted verdict + timestamps. No network — safe on the boot path. */
+    fun getAuthState(): Map<String, Any?> = authRecovery.getAuthState()
+
+    /**
+     * Prove — or repair — the session on the host's schedule. Returns "ok" · "refreshed" ·
+     * "recovered" · "reauth_required" · "network_error" · "no_session" · "api_key".
+     */
+    suspend fun ensureFreshSession(): String {
+        if (secureStorage.getUserId() == null || !secureStorage.hasAuth) return "no_session"
+        if (secureStorage.isApiKeyAuth) return "api_key"
+        val outcome = authRecovery.ensureFreshSession()
+        if (outcome == "refreshed" || outcome == "recovered") {
+            ensureSyncManager().retryOutboxIfPossible()
+        }
+        return outcome
+    }
 
     // -----------------------------------------------------------------------
     // Authorization
@@ -428,7 +489,11 @@ class OpenWearablesHealthSDK private constructor(
 
     private fun rebuildSyncManager() {
         val provider = activeProvider ?: return
-        syncManager = SyncManager(context, secureStorage, provider, dispatchers, ::logMessage, ::emitAuthError)
+        syncManager = SyncManager(
+            context, secureStorage, provider, dispatchers, ::logMessage, ::emitAuthError,
+            { state -> authStateListener?.invoke(state) },
+            { via -> authRecoveredListener?.invoke(via) }
+        )
     }
 
     @Synchronized
@@ -448,19 +513,8 @@ class OpenWearablesHealthSDK private constructor(
     // Logging
     // -----------------------------------------------------------------------
 
-    /**
-     * Sets the log level. Convenience wrapper mirroring the iOS API, intended
-     * for cross-platform bridges (React Native, Flutter) and Java callers.
-     * 
-     * NOTE: This explicit function was commented out to resolve a Kotlin Platform
-     * Declaration Clash in the JVM bytecode. The `var logLevel` property on line 83
-     * automatically generates a `public void setLogLevel(OWLogLevel level)` method
-     * for Java interop, making this explicit function redundant and causing a build failure.
-     * Java/React Native callers can still use `setLogLevel()` seamlessly.
-     */
-    // fun setLogLevel(level: OWLogLevel) {
-    //     this.logLevel = level
-    // }
+    // Note: `var logLevel` already exposes a `setLogLevel(OWLogLevel)` accessor
+    // for Java callers; an explicit fun with that name would clash with it.
 
     internal fun logMessage(message: String) {
         when (logLevel) {

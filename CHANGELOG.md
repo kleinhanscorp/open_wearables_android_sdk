@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased — Gutsy fork (`kleinhanscorp/open_wearables_android_sdk`), on top of 0.11.2
+
+* **Refresh-rotation lockout closed** (upstream #1379). Token writes are now synchronous (`commit()`), **refresh-token-first and read-back-verified**; a rejected refresh **re-reads storage** and adopts a newer pair if a concurrent writer already installed one; refresh + recovery run under a **process-wide mutex** (`HealthSyncWorker` builds its own `SyncManager`, so a per-manager lock protected nothing).
+* **Native renewal (JS-free self-heal)**: `setRenewalCredential(url, token)` installs a long-lived, non-rotating credential the SDK exchanges for a fresh pair when refresh is rejected — 60 s spacing, two-strike cutoff. `clearRenewalCredential()`, `hasRenewalCredential()`.
+* **Sticky auth ledger**: `getAuthState()` (`ok` / `recovering` / `reauth_required` + timestamps), `authStateListener`, `authRecoveredListener`. `authErrorListener` fires only after the ladder is exhausted and the verdict is persisted.
+* **`ensureFreshSession()`** (suspend): the host-safe session probe — proactive refresh inside 5 minutes of expiry, ladder on rejection.
+* **Sign-out revokes** the refresh token server-side, best-effort (RFC 7009).
+* Kept from the earlier fork commit: fully buffered upload body with `Content-Length` (OpenLiteSpeed rejects chunked transfer encoding).
+
 ## 0.11.2
 
 * **New `getSyncStatus()` fields**: `initialExportDone` (Bool) and `isSyncing` (Bool) — allows apps to show progress UI during the initial historical export.

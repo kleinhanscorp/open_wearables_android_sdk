@@ -36,6 +36,16 @@ class SecureStorage(private val context: Context) {
         private const val KEY_SYNC_DAYS_BACK = "syncDaysBack"
         private const val KEY_NOTIFICATION_TITLE = "notificationTitle"
         private const val KEY_NOTIFICATION_TEXT = "notificationText"
+
+        // Gutsy fork — the renewal credential (encrypted prefs) and the auth ledger (config prefs).
+        // See `AuthRecovery.kt` for the state machine these keys back.
+        private const val KEY_RENEWAL_URL = "renewalUrl"
+        private const val KEY_RENEWAL_TOKEN = "renewalToken"
+        private const val KEY_AUTH_STATE = "authState"
+        private const val KEY_AUTH_LAST_ERROR_AT = "authLastErrorAt"
+        private const val KEY_AUTH_LAST_RECOVERED_AT = "authLastRecoveredAt"
+        private const val KEY_AUTH_RENEWAL_FAILURES = "authRenewalFailures"
+        private const val KEY_AUTH_LAST_RENEWAL_ATTEMPT_AT = "authLastRenewalAttemptAt"
     }
 
     /**
@@ -118,11 +128,12 @@ class SecureStorage(private val context: Context) {
     // MARK: - Credentials
 
     fun saveCredentials(userId: String, accessToken: String?, refreshToken: String?) {
+        // commit(), not apply(): a credential write must be on disk before the caller acts on it.
         securePrefs.edit().apply {
             putString(KEY_USER_ID, userId)
-            if (accessToken != null) putString(KEY_ACCESS_TOKEN, accessToken)
             if (refreshToken != null) putString(KEY_REFRESH_TOKEN, refreshToken)
-            apply()
+            if (accessToken != null) putString(KEY_ACCESS_TOKEN, accessToken)
+            commit()
         }
     }
 
@@ -139,12 +150,89 @@ class SecureStorage(private val context: Context) {
 
     // MARK: - Update Tokens (after refresh)
 
-    fun updateTokens(accessToken: String, refreshToken: String?) {
-        securePrefs.edit().apply {
-            putString(KEY_ACCESS_TOKEN, accessToken)
-            if (refreshToken != null) putString(KEY_REFRESH_TOKEN, refreshToken)
-            apply()
+    /**
+     * Persist a rotated pair. The server has ALREADY revoked the refresh token we presented by the
+     * time this runs (strict rotation, zero grace), so the write must be synchronous (`commit()`)
+     * and the refresh token goes first: a process death between the two writes then leaves
+     * {expired access, NEW refresh} — which recovers on the next 401 — instead of
+     * {fresh access, REVOKED refresh}, which locks the device out an hour later.
+     * Read back and verified; a mismatch is retried once. Returns whether the pair is durable.
+     */
+    fun updateTokens(accessToken: String, refreshToken: String?): Boolean {
+        repeat(2) {
+            securePrefs.edit().apply {
+                if (refreshToken != null) putString(KEY_REFRESH_TOKEN, refreshToken)
+                putString(KEY_ACCESS_TOKEN, accessToken)
+                commit()
+            }
+            val refreshOk = refreshToken == null || getRefreshToken() == refreshToken
+            if (refreshOk && getAccessToken() == accessToken) return true
+            Log.w(TAG, "Token write verification failed - retrying once")
         }
+        Log.e(TAG, "Token write verification failed after retry")
+        return false
+    }
+
+    // MARK: - Renewal credential (Gutsy fork)
+
+    fun saveRenewalCredential(url: String, token: String) {
+        securePrefs.edit().apply {
+            putString(KEY_RENEWAL_URL, url)
+            putString(KEY_RENEWAL_TOKEN, token)
+            commit()
+        }
+    }
+
+    fun getRenewalUrl(): String? = securePrefs.getString(KEY_RENEWAL_URL, null)
+
+    fun getRenewalToken(): String? = securePrefs.getString(KEY_RENEWAL_TOKEN, null)
+
+    fun hasRenewalCredential(): Boolean = getRenewalUrl() != null && getRenewalToken() != null
+
+    fun clearRenewalCredential() {
+        securePrefs.edit().remove(KEY_RENEWAL_URL).remove(KEY_RENEWAL_TOKEN).commit()
+    }
+
+    // MARK: - Auth ledger (Gutsy fork; config prefs — not secret, must survive process death)
+
+    fun getAuthState(): String = configPrefs.getString(KEY_AUTH_STATE, AuthRecovery.STATE_OK) ?: AuthRecovery.STATE_OK
+
+    fun saveAuthState(state: String) {
+        configPrefs.edit().putString(KEY_AUTH_STATE, state).commit()
+    }
+
+    fun getLastAuthErrorAt(): Long = configPrefs.getLong(KEY_AUTH_LAST_ERROR_AT, 0L)
+
+    fun setLastAuthErrorAt(ms: Long) {
+        configPrefs.edit().putLong(KEY_AUTH_LAST_ERROR_AT, ms).commit()
+    }
+
+    fun getLastRecoveredAt(): Long = configPrefs.getLong(KEY_AUTH_LAST_RECOVERED_AT, 0L)
+
+    fun setLastRecoveredAt(ms: Long) {
+        configPrefs.edit().putLong(KEY_AUTH_LAST_RECOVERED_AT, ms).commit()
+    }
+
+    fun getRenewalFailures(): Int = configPrefs.getInt(KEY_AUTH_RENEWAL_FAILURES, 0)
+
+    fun setRenewalFailures(count: Int) {
+        configPrefs.edit().putInt(KEY_AUTH_RENEWAL_FAILURES, count).commit()
+    }
+
+    fun getLastRenewalAttemptAt(): Long = configPrefs.getLong(KEY_AUTH_LAST_RENEWAL_ATTEMPT_AT, 0L)
+
+    fun setLastRenewalAttemptAt(ms: Long) {
+        configPrefs.edit().putLong(KEY_AUTH_LAST_RENEWAL_ATTEMPT_AT, ms).commit()
+    }
+
+    fun clearAuthLedger() {
+        configPrefs.edit()
+            .remove(KEY_AUTH_STATE)
+            .remove(KEY_AUTH_LAST_ERROR_AT)
+            .remove(KEY_AUTH_LAST_RECOVERED_AT)
+            .remove(KEY_AUTH_RENEWAL_FAILURES)
+            .remove(KEY_AUTH_LAST_RENEWAL_ATTEMPT_AT)
+            .commit()
     }
 
     // MARK: - API Key (alternative auth mode)
@@ -272,8 +360,11 @@ class SecureStorage(private val context: Context) {
             .remove(KEY_REFRESH_TOKEN)
             .remove(KEY_USER_ID)
             .remove(KEY_API_KEY)
+            .remove(KEY_RENEWAL_URL)
+            .remove(KEY_RENEWAL_TOKEN)
             .commit()
 
+        // clear() also wipes the auth ledger (config prefs) — a sign-out is a clean slate.
         configPrefs.edit().clear().commit()
         configPrefs.edit().putBoolean(KEY_APP_INSTALLED, true).commit()
     }

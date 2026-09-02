@@ -60,7 +60,10 @@ class SyncManager(
     private val healthProvider: HealthDataProvider,
     private val dispatchers: DispatcherProvider,
     private val logger: (String) -> Unit,
-    private val onAuthError: ((Int, String) -> Unit)? = null
+    private val onAuthError: ((Int, String) -> Unit)? = null,
+    // Gutsy fork — relayed to the host by the SDK singleton; null inside HealthSyncWorker.
+    private val onAuthStateChanged: ((String) -> Unit)? = null,
+    private val onAuthRecovered: ((String) -> Unit)? = null
 ) {
     companion object {
         val sharedHttpClient: OkHttpClient by lazy {
@@ -85,8 +88,12 @@ class SyncManager(
             .withZone(java.time.ZoneOffset.UTC)
 
     private val isSyncing = AtomicBoolean(false)
-    private val tokenRefreshLock = ReentrantLock()
-    private var isRefreshingToken = false
+
+    // Gutsy fork — refresh + recovery live here; the lock is process-wide (AuthRecovery.companion),
+    // which a per-manager ReentrantLock never was: HealthSyncWorker builds its own SyncManager.
+    private val authRecovery: AuthRecovery by lazy {
+        AuthRecovery(secureStorage, httpClient, logger, onAuthStateChanged, onAuthRecovered, dispatchers.io)
+    }
 
     private val stateMutex = Mutex()
     private var inMemoryState: SyncState? = null
@@ -150,6 +157,9 @@ class SyncManager(
 
     private fun emitAuthError(statusCode: Int) {
         logger("Auth error: HTTP $statusCode - token invalid")
+        // Persist the verdict FIRST: the host may not be alive to receive the callback (this can run
+        // inside HealthSyncWorker at 04:00), but it will read `getAuthState()` at its next launch.
+        authRecovery.markReauthRequired()
         onAuthError?.invoke(statusCode, "Unauthorized - please re-authenticate")
     }
 
@@ -563,55 +573,16 @@ class SyncManager(
         SUCCESS, AUTH_FAILURE, NETWORK_ERROR
     }
 
-    private suspend fun attemptTokenRefresh(): TokenRefreshResult = withContext(dispatchers.io) {
-        tokenRefreshLock.withLock { isRefreshingToken = true }
-        try {
-            val refreshToken = secureStorage.getRefreshToken()
-            val apiBaseUrl = secureStorage.apiBaseUrl
-            if (refreshToken == null || apiBaseUrl == null) {
-                logger("Token refresh: missing credentials")
-                return@withContext TokenRefreshResult.AUTH_FAILURE
-            }
-
-            val url = "$apiBaseUrl/token/refresh"
-            val bodyMap = mapOf("refresh_token" to refreshToken)
-            val body = json.encodeToString(bodyMap)
-            val request = Request.Builder()
-                .url(url)
-                .post(body.toRequestBody("application/json".toMediaType()))
-                .header("Content-Type", "application/json")
-                .build()
-
-            val response = httpClient.newCall(request).execute()
-            val responseBody = response.body?.string()
-
-            if (response.code in 401..403) {
-                logger("Token refresh rejected: HTTP ${response.code}")
-                return@withContext TokenRefreshResult.AUTH_FAILURE
-            }
-
-            if (response.isSuccessful && responseBody != null) {
-                val jsonObj = json.parseToJsonElement(responseBody).jsonObject
-                val newAccessToken = jsonObj["access_token"]?.jsonPrimitive?.contentOrNull
-                val newRefreshToken = jsonObj["refresh_token"]?.jsonPrimitive?.contentOrNull
-                if (newAccessToken != null) {
-                    secureStorage.updateTokens(newAccessToken, newRefreshToken)
-                    logger("Token refresh: HTTP ${response.code}")
-                    return@withContext TokenRefreshResult.SUCCESS
-                } else {
-                    logger("Token refresh failed: HTTP ${response.code} (no access_token in response)")
-                }
-            } else {
-                logger("Token refresh failed: HTTP ${response.code}")
-            }
-            TokenRefreshResult.NETWORK_ERROR
-        } catch (e: Exception) {
-            logger("Token refresh failed: ${e.javaClass.simpleName}: ${e.message}")
-            TokenRefreshResult.NETWORK_ERROR
-        } finally {
-            tokenRefreshLock.withLock { isRefreshingToken = false }
+    /**
+     * Gutsy fork: delegated to [AuthRecovery] — process-wide single-flight, refresh-first verified
+     * persistence, the double-check on rejection, and native renewal. Same result contract as before.
+     */
+    private suspend fun attemptTokenRefresh(): TokenRefreshResult =
+        when (authRecovery.refreshTokens()) {
+            AuthRecovery.Result.SUCCESS -> TokenRefreshResult.SUCCESS
+            AuthRecovery.Result.AUTH_FAILURE -> TokenRefreshResult.AUTH_FAILURE
+            AuthRecovery.Result.NETWORK_ERROR -> TokenRefreshResult.NETWORK_ERROR
         }
-    }
 
     // MARK: - Send with Auth Retry
 
