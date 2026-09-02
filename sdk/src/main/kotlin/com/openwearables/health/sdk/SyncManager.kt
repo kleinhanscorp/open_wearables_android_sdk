@@ -1014,12 +1014,17 @@ class SyncManager(
 
     fun getSyncStatus(): Map<String, Any?> {
         val state = inMemoryState ?: loadSyncStateFromDisk()
+        // Whether the initial full export (whole history) has ever completed for
+        // this user. While false, apps can show a "keep the app open" hint.
+        val initialExportDone = hasCompletedInitialSync()
         return if (state != null) {
             mapOf(
                 "hasResumableSession" to state.hasProgress,
                 "sentCount" to state.totalSentCount,
                 "completedTypes" to state.completedTypes.size,
                 "isFullExport" to state.fullExport,
+                "initialExportDone" to initialExportDone,
+                "isSyncing" to isSyncing.get(),
                 "createdAt" to dateFormatter.format(java.time.Instant.ofEpochMilli(state.createdAt))
             )
         } else {
@@ -1028,6 +1033,8 @@ class SyncManager(
                 "sentCount" to 0,
                 "completedTypes" to 0,
                 "isFullExport" to false,
+                "initialExportDone" to initialExportDone,
+                "isSyncing" to isSyncing.get(),
                 "createdAt" to null
             )
         }

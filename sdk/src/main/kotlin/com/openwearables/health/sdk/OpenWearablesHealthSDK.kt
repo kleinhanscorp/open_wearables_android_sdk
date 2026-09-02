@@ -289,11 +289,6 @@ class OpenWearablesHealthSDK private constructor(
         logMessage("Background sync stopped")
     }
 
-    suspend fun syncNow() {
-        val h = host ?: throw IllegalStateException("Host not configured")
-        ensureSyncManager().syncNow(h, customSyncUrl, fullExport = false)
-    }
-
     fun resetAnchors() {
         val sm = ensureSyncManager()
         sm.resetAnchors()
