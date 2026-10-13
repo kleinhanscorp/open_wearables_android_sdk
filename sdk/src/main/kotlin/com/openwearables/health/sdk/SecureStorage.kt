@@ -22,6 +22,9 @@ class SecureStorage(private val context: Context) {
         private const val PREFS_NAME = "com.openwearables.healthsdk.secure"
         private const val CONFIG_PREFS_NAME = "com.openwearables.healthsdk.config"
 
+        internal val connectionLock = Any()
+        private const val KEY_CONNECTION_GENERATION = "connectionGeneration"
+        private const val KEY_DEVICE_ID = "deviceId"
         private const val KEY_ACCESS_TOKEN = "accessToken"
         private const val KEY_REFRESH_TOKEN = "refreshToken"
         private const val KEY_USER_ID = "userId"
@@ -126,6 +129,38 @@ class SecureStorage(private val context: Context) {
     }
 
     // MARK: - Credentials
+
+    internal data class ConnectionOwner(val userId: String?, val generation: String)
+
+    fun connectionGeneration(): String = synchronized(connectionLock) {
+        configPrefs.getString(KEY_CONNECTION_GENERATION, null) ?: invalidateConnection()
+    }
+
+    fun invalidateConnection(): String = synchronized(connectionLock) {
+        val value = java.util.UUID.randomUUID().toString()
+        check(configPrefs.edit().putString(KEY_CONNECTION_GENERATION, value).commit())
+        value
+    }
+
+    fun deviceId(): String = synchronized(connectionLock) {
+        configPrefs.getString(KEY_DEVICE_ID, null) ?: java.util.UUID.randomUUID().toString().also {
+            check(configPrefs.edit().putString(KEY_DEVICE_ID, it).commit())
+        }
+    }
+
+    fun deviceConnectionGeneration(): String? = configPrefs.getString("deviceConnectionGeneration", null)
+    fun setDeviceConnectionGeneration(value: String) {
+        check(configPrefs.edit().putString("deviceConnectionGeneration", value).commit())
+    }
+    internal fun connectionOwner() = synchronized(connectionLock) {
+        ConnectionOwner(getUserId(), connectionGeneration())
+    }
+    internal fun isCurrent(owner: ConnectionOwner) = synchronized(connectionLock) {
+        owner.generation == connectionGeneration() && owner.userId == getUserId()
+    }
+    internal fun <T> withConnection(owner: ConnectionOwner, action: () -> T): T? = synchronized(connectionLock) {
+        if (isCurrent(owner)) action() else null
+    }
 
     fun saveCredentials(userId: String, accessToken: String?, refreshToken: String?) {
         // commit(), not apply(): a credential write must be on disk before the caller acts on it.
@@ -365,7 +400,10 @@ class SecureStorage(private val context: Context) {
             .commit()
 
         // clear() also wipes the auth ledger (config prefs) — a sign-out is a clean slate.
-        configPrefs.edit().clear().commit()
+        val generation = connectionGeneration()
+        val device = deviceId()
+        configPrefs.edit().clear().putString(KEY_CONNECTION_GENERATION, generation)
+            .putString(KEY_DEVICE_ID, device).commit()
         configPrefs.edit().putBoolean(KEY_APP_INSTALLED, true).commit()
     }
 }

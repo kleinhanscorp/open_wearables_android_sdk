@@ -61,6 +61,11 @@ internal class AuthRecovery(
 
         /** Process-wide single-flight for refresh + recovery. */
         private val refreshMutex = Mutex()
+        private val validationMutex = Mutex()
+        private var validationOwner: SecureStorage.ConnectionOwner? = null
+        private var validationCompletedAt = 0L
+        private var validationResult = false
+        private var validationBackoffUntil = 0L
 
         private val JSON_MEDIA = "application/json".toMediaType()
 
@@ -71,8 +76,13 @@ internal class AuthRecovery(
     // ───────────────────────────── Public surface (via the SDK) ─────────────────────────────
 
     /** Refresh under the process-wide lock, walking the recovery ladder on rejection. */
-    suspend fun refreshTokens(): Result = refreshMutex.withLock {
-        withContext(ioDispatcher) { refreshLocked() }
+    suspend fun refreshTokens(): Result {
+        // Capture BEFORE waiting: an old waiter may not adopt the replacement member's pair.
+        val owner = storage.connectionOwner()
+        return refreshMutex.withLock {
+            if (!storage.isCurrent(owner)) return@withLock Result.NETWORK_ERROR
+            withContext(ioDispatcher) { refreshLocked(owner) }
+        }
     }
 
     /**
@@ -93,6 +103,56 @@ internal class AuthRecovery(
             }
             Result.AUTH_FAILURE -> "reauth_required"
             Result.NETWORK_ERROR -> "network_error"
+        }
+    }
+
+    /** Verify this device lease before new upload work. Does not rotate/mint tokens. */
+    suspend fun validateDeviceLease(owner: SecureStorage.ConnectionOwner): Boolean {
+        val initiatedAt = System.currentTimeMillis()
+        return validationMutex.withLock {
+            if (!storage.isCurrent(owner)) return@withLock false
+            // A waiter shares the result completed after it entered, never a later owner's result.
+            if (validationOwner == owner && validationCompletedAt >= initiatedAt) return@withLock validationResult
+            if (validationOwner == owner && initiatedAt < validationBackoffUntil) return@withLock false
+            validationOwner = owner
+            val result = withContext(ioDispatcher) {
+                val request = storage.withConnection(owner) {
+                    val url = storage.getRenewalUrl() ?: return@withConnection null
+                    val token = storage.getRenewalToken() ?: return@withConnection null
+                    val generation = storage.deviceConnectionGeneration() ?: return@withConnection null
+                    val body = JSONObject().put("renewal_token", token).put("validate_only", true)
+                        .toString().toRequestBody(JSON_MEDIA)
+                    Pair(Request.Builder().url(url).post(body).header("Content-Type", "application/json").build(), generation)
+                } ?: return@withContext false
+                try {
+                    if (!storage.isCurrent(owner)) return@withContext false
+                    httpClient.newCall(request.first).execute().use { response ->
+                        val text = response.body?.string()
+                        storage.withConnection(owner) {
+                            if (response.code == 401 || response.code == 403 || response.code == 410) {
+                                markReauthRequired(); storage.invalidateConnection(); false
+                            } else if (response.isSuccessful && text != null) {
+                                val json = JSONObject(text)
+                                json.optBoolean("lease_active", false) &&
+                                    json.optString("connection_generation") == request.second &&
+                                    json.optString("device_id") == storage.deviceId()
+                            } else {
+                                val seconds = if (response.code == 429) response.header("Retry-After")?.toLongOrNull() ?: 900L else 60L
+                                validationBackoffUntil = System.currentTimeMillis() + seconds.coerceIn(60L, 3600L) * 1000L
+                                false
+                            }
+                        } ?: false
+                    }
+                } catch (e: Exception) {
+                    validationBackoffUntil = System.currentTimeMillis() + 60_000L
+                    logger("Device lease validation unavailable; sync remains pending")
+                    false
+                }
+            }
+            validationResult = result
+            validationCompletedAt = System.currentTimeMillis()
+            if (!result && validationBackoffUntil < validationCompletedAt) validationBackoffUntil = validationCompletedAt + 60_000L
+            result
         }
     }
 
@@ -167,17 +227,19 @@ internal class AuthRecovery(
 
     // ───────────────────────────── The ladder (runs under refreshMutex) ─────────────────────
 
-    private fun refreshLocked(): Result {
-        val base = storage.apiBaseUrl
+    private fun refreshLocked(owner: SecureStorage.ConnectionOwner): Result {
+        val pair = storage.withConnection(owner) { Pair(storage.apiBaseUrl, storage.getRefreshToken()) }
+            ?: return Result.NETWORK_ERROR
+        val base = pair.first
         if (base == null) {
             logger("Token refresh failed: not configured")
             return Result.NETWORK_ERROR
         }
-        val presented = storage.getRefreshToken()
+        val presented = pair.second
         if (presented == null) {
             // A lost write or a partial sign-in. Not necessarily fatal: renewal can still mint a pair.
             logger("Token refresh: no refresh token - trying recovery")
-            return resolveRefreshRejection(null)
+            return resolveRefreshRejection(null, owner)
         }
 
         return try {
@@ -190,11 +252,10 @@ internal class AuthRecovery(
             httpClient.newCall(request).execute().use { response ->
                 val code = response.code
                 val text = response.body?.string()
-                when {
-                    code in 401..403 -> {
-                        logger("Token refresh rejected: HTTP $code - starting recovery")
-                        resolveRefreshRejection(presented)
-                    }
+                if (code in 401..403) {
+                    return@use resolveRefreshRejection(presented, owner)
+                }
+                storage.withConnection(owner) { when {
                     !response.isSuccessful || text == null -> {
                         logger("Token refresh failed: HTTP $code")
                         Result.NETWORK_ERROR
@@ -219,7 +280,7 @@ internal class AuthRecovery(
                             }
                         }
                     }
-                }
+                } } ?: Result.NETWORK_ERROR
             }
         } catch (e: Exception) {
             logger("Token refresh failed: ${e.javaClass.simpleName}: ${e.message}")
@@ -227,31 +288,36 @@ internal class AuthRecovery(
         }
     }
 
-    private fun resolveRefreshRejection(presented: String?): Result {
+    private fun resolveRefreshRejection(presented: String?, owner: SecureStorage.ConnectionOwner): Result {
+        if (!storage.isCurrent(owner)) return Result.NETWORK_ERROR
         // 1. Did another writer already install a newer refresh token? Then the rejection was for
         //    a stale value and the session is fine.
         val current = storage.getRefreshToken()
         if (current != null && current != presented) {
             logger("Refresh rejected for a superseded token - a newer pair is already installed")
-            markAuthOk("double-check")
-            return Result.SUCCESS
+            return storage.withConnection(owner) { markAuthOk("double-check"); Result.SUCCESS }
+                ?: Result.NETWORK_ERROR
         }
 
         // 2. Native renewal.
-        transition(STATE_RECOVERING)
-        return when (attemptRenewal()) {
+        storage.withConnection(owner) { transition(STATE_RECOVERING) } ?: return Result.NETWORK_ERROR
+        val outcome = attemptRenewal(owner)
+        return storage.withConnection(owner) { when (outcome) {
             RenewalOutcome.RENEWED -> Result.SUCCESS
             RenewalOutcome.TRANSIENT -> Result.NETWORK_ERROR // stay `recovering`; next trigger retries after the backoff
             RenewalOutcome.REJECTED, RenewalOutcome.UNAVAILABLE -> {
                 markReauthRequired()
                 Result.AUTH_FAILURE
             }
-        }
+        } } ?: Result.NETWORK_ERROR
     }
 
-    private fun attemptRenewal(): RenewalOutcome {
-        val url = storage.getRenewalUrl()
-        val token = storage.getRenewalToken()
+    private fun attemptRenewal(owner: SecureStorage.ConnectionOwner): RenewalOutcome {
+        if (!storage.isCurrent(owner)) return RenewalOutcome.TRANSIENT
+        val credential = storage.withConnection(owner) { Pair(storage.getRenewalUrl(), storage.getRenewalToken()) }
+            ?: return RenewalOutcome.TRANSIENT
+        val url = credential.first
+        val token = credential.second
         if (url == null || token == null) {
             logger("Renewal unavailable: no renewal credential installed")
             return RenewalOutcome.UNAVAILABLE
@@ -267,7 +333,7 @@ internal class AuthRecovery(
             logger("Renewal skipped: attempted ${sinceLast / 1000}s ago")
             return RenewalOutcome.TRANSIENT
         }
-        storage.setLastRenewalAttemptAt(System.currentTimeMillis())
+        storage.withConnection(owner) { storage.setLastRenewalAttemptAt(System.currentTimeMillis()) } ?: return RenewalOutcome.TRANSIENT
 
         logger("Renewing SDK credentials via host...")
         return try {
@@ -286,7 +352,7 @@ internal class AuthRecovery(
             httpClient.newCall(request).execute().use { response ->
                 val code = response.code
                 val text = response.body?.string()
-                when {
+                storage.withConnection(owner) { when {
                     code == 401 || code == 403 || code == 410 -> {
                         storage.setRenewalFailures(failures + 1)
                         logger("Renewal rejected: HTTP $code (${failures + 1}x)")
@@ -313,7 +379,7 @@ internal class AuthRecovery(
                             RenewalOutcome.RENEWED
                         }
                     }
-                }
+                } } ?: RenewalOutcome.TRANSIENT
             }
         } catch (e: Exception) {
             logger("Renewal failed: ${e.javaClass.simpleName}: ${e.message}")

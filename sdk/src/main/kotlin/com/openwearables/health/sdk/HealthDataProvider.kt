@@ -75,4 +75,12 @@ interface HealthDataProvider {
         olderThanTimestamp: Long? = null,
         limit: Int = 1000
     ): ProviderReadResult = ProviderReadResult(UnifiedHealthData(), null, null)
+    /** Native page tokens, not converted sample counts, determine traversal completion. */
+    val supportsNativePages: Boolean get() = false
+    suspend fun readPage(typeId: String, query: ProviderPageQuery, pageToken: String?): ProviderReadResult {
+        check(pageToken == null) { "Provider does not support native page tokens" }
+        return if (query.ascending) readData(typeId, query.startMs, query.pageSize)
+        else readDataDescending(typeId, query.endMs, query.pageSize)
+    }
+
 }

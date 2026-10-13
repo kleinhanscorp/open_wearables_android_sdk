@@ -208,7 +208,9 @@ class OpenWearablesHealthSDK private constructor(
     // Authentication
     // -----------------------------------------------------------------------
 
-    suspend fun signIn(userId: String, accessToken: String?, refreshToken: String?, apiKey: String?) {
+    fun signIn(userId: String, accessToken: String?, refreshToken: String?, apiKey: String?) {
+        synchronized(SecureStorage.connectionLock) {
+        secureStorage.invalidateConnection()
         val sm = ensureSyncManager()
         sm.clearSyncSession()
         sm.resetAnchors()
@@ -224,9 +226,11 @@ class OpenWearablesHealthSDK private constructor(
         }
 
         logMessage("Signed in: userId=$userId, mode=${if (accessToken != null) "token" else "apiKey"}")
+        }
     }
 
-    suspend fun signOut() {
+    fun signOut() = synchronized(SecureStorage.connectionLock) {
+        secureStorage.invalidateConnection()
         logMessage("Signing out")
         // Before storage is wiped: tell the server this refresh token is done (fire-and-forget).
         authRecovery.revokeRefreshTokenBestEffort()
@@ -239,6 +243,32 @@ class OpenWearablesHealthSDK private constructor(
         activeProvider = null
         syncManager = null
         logMessage("Sign out complete")
+    }
+
+    fun invalidateConnection(): String = secureStorage.invalidateConnection()
+    fun connectionGeneration(): String = secureStorage.connectionGeneration()
+    fun deviceId(): String = secureStorage.deviceId()
+
+    /** One synchronous fenced bridge call, including renewal; old bridge ABI remains available. */
+    fun installConnection(expected: String, userId: String, access: String, refresh: String,
+                          renewalUrl: String?, renewalToken: String?, fresh: Boolean, deviceGeneration: String): String? =
+        synchronized(SecureStorage.connectionLock) {
+            if (expected != secureStorage.connectionGeneration()) return@synchronized null
+            if (fresh) signIn(userId, access, refresh, null)
+            else {
+                if (secureStorage.getUserId() != userId) return@synchronized null
+                updateTokens(access, refresh)
+            }
+            if (renewalUrl != null && renewalToken != null) authRecovery.setRenewalCredential(renewalUrl, renewalToken)
+            if (secureStorage.getAccessToken() != access || secureStorage.getRefreshToken() != refresh) return@synchronized null
+            secureStorage.setDeviceConnectionGeneration(deviceGeneration)
+            secureStorage.connectionGeneration()
+        }
+
+    fun signOutConnection(expected: String): Boolean = synchronized(SecureStorage.connectionLock) {
+        if (expected != secureStorage.connectionGeneration()) return@synchronized false
+        signOut()
+        true
     }
 
     fun restoreSession(): String? {
@@ -256,9 +286,11 @@ class OpenWearablesHealthSDK private constructor(
     fun isSyncActive(): Boolean = secureStorage.isSyncActive()
 
     /** Gutsy fork: also lifts any `recovering` / `reauth_required` verdict — the host has repaired us. */
-    fun updateTokens(accessToken: String, refreshToken: String?) {
+    fun updateTokens(accessToken: String, refreshToken: String?) = synchronized(SecureStorage.connectionLock) {
+        secureStorage.invalidateConnection()
         val persisted = secureStorage.updateTokens(accessToken, refreshToken)
         logMessage(if (persisted) "Tokens updated" else "Tokens updated but storage verification failed")
+        if (!persisted) return@synchronized
         secureStorage.setRenewalFailures(0)
         authRecovery.markAuthOk("external")
         ensureSyncManager().retryOutboxIfPossible()
@@ -266,6 +298,7 @@ class OpenWearablesHealthSDK private constructor(
 
     fun getStoredCredentials(): Map<String, Any?> = mapOf(
         "userId" to secureStorage.getUserId(),
+        "deviceConnectionGeneration" to secureStorage.deviceConnectionGeneration(),
         "accessToken" to secureStorage.getAccessToken(),
         "refreshToken" to secureStorage.getRefreshToken(),
         "apiKey" to secureStorage.getApiKey(),

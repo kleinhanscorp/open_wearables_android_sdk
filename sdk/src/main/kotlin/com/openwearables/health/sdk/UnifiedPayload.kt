@@ -167,8 +167,14 @@ data class UnifiedHealthData(
 data class ProviderReadResult(
     val data: UnifiedHealthData,
     val maxTimestamp: Long?,
-    val minTimestamp: Long? = null
+    val minTimestamp: Long? = null,
+    val nativeRecordCount: Int? = null,
+    val nextPageToken: String? = null,
+    val nativePage: Boolean = false
 )
+
+/** Immutable query retained across every native page, including resume and timestamp ties. */
+data class ProviderPageQuery(val startMs: Long, val endMs: Long, val pageSize: Int, val ascending: Boolean)
 
 // ---------------------------------------------------------------------------
 // Timestamp helpers

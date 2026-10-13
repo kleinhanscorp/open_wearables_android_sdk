@@ -29,7 +29,13 @@ data class TypeSyncProgress(
     var sentCount: Int = 0,
     var isComplete: Boolean = false,
     var pendingAnchorTimestamp: Long? = null,
-    var pendingOlderThan: Long? = null
+    var pendingOlderThan: Long? = null,
+    var nativePageToken: String? = null,
+    var queryStartMs: Long? = null,
+    var queryEndMs: Long? = null,
+    var nativePageSize: Int? = null,
+    var nativePageCount: Int = 0,
+    var nativeTokenHashes: MutableSet<String> = mutableSetOf()
 )
 
 @Serializable
@@ -37,6 +43,8 @@ data class SyncState(
     val userKey: String,
     val fullExport: Boolean,
     val createdAt: Long,
+    val connectionGeneration: String? = null,
+    val syncSessionId: String = java.util.UUID.randomUUID().toString(),
     var typeProgress: MutableMap<String, TypeSyncProgress> = mutableMapOf(),
     var totalSentCount: Int = 0,
     var completedTypes: MutableSet<String> = mutableSetOf(),
@@ -97,6 +105,12 @@ class SyncManager(
 
     private val stateMutex = Mutex()
     private var inMemoryState: SyncState? = null
+    private var syncOwner: SecureStorage.ConnectionOwner? = null
+    private fun requireSyncOwner(): SecureStorage.ConnectionOwner {
+        val owner = syncOwner ?: error("Sync has no initiating owner")
+        check(secureStorage.isCurrent(owner)) { "Sync connection superseded; progress retained" }
+        return owner
+    }
 
     private var fullSyncStartTime: Long? = null
     private var currentLogsEndpoint: String? = null
@@ -216,7 +230,7 @@ class SyncManager(
         logger("Scheduled expedited sync")
     }
 
-    suspend fun stopBackgroundSync() {
+    fun stopBackgroundSync() {
         WorkManager.getInstance(context).cancelUniqueWork(SyncDefaults.WORK_NAME_PERIODIC)
         logger("Cancelled periodic sync")
     }
@@ -229,8 +243,16 @@ class SyncManager(
             return
         }
 
+        val owner = secureStorage.connectionOwner()
+        syncOwner = owner
         try {
-            val userId = secureStorage.getUserId()
+            requireSyncOwner()
+            if (!authRecovery.validateDeviceLease(owner)) {
+                logger("Device lease unverified; native traversal remains pending")
+                return
+            }
+            requireSyncOwner()
+            val userId = owner.userId
             if (userId == null || !secureStorage.hasAuth) {
                 logger("No credentials for sync")
                 return
@@ -245,7 +267,8 @@ class SyncManager(
             }
 
             val existingState = stateMutex.withLock { loadSyncStateFromDisk() }
-            val isResuming = existingState != null && existingState.hasProgress
+            val isResuming = existingState != null && existingState.hasProgress &&
+                existingState.userKey == userKey() && existingState.connectionGeneration == owner.generation
 
             val floor = syncStartTimestamp()
             val floorLabel = if (floor != null) "since ${java.time.Instant.ofEpochMilli(floor)}" else "full history"
@@ -262,7 +285,7 @@ class SyncManager(
                 stateMutex.withLock {
                     inMemoryState = SyncState(
                         userKey = userKey(), fullExport = effectiveFullExport,
-                        createdAt = System.currentTimeMillis()
+                        createdAt = System.currentTimeMillis(), connectionGeneration = owner.generation
                     )
                     persistStateToDisk()
                 }
@@ -313,7 +336,9 @@ class SyncManager(
         val count: Int = 0,
         val nextCursor: Long? = null,
         val anchorTimestamp: Long? = null,
-        val isDone: Boolean = false
+        val isDone: Boolean = false,
+        val nativePage: Boolean = false,
+        val nextPageToken: String? = null
     )
 
     private suspend fun processTypesRoundRobin(
@@ -364,7 +389,9 @@ class SyncManager(
             val roundResults = mutableListOf<FetchResult>()
 
             for (type in incompleteTypes) {
-                val result = if (fullExport) {
+                val result = if (healthProvider.supportsNativePages) {
+                    fetchNativePage(type, fullExport, perTypeLimit)
+                } else if (fullExport) {
                     fetchOneChunkNewestFirst(type, olderThanCursors[type], perTypeLimit)
                 } else {
                     fetchOneChunkIncremental(type, anchorCursors[type], perTypeLimit)
@@ -390,7 +417,9 @@ class SyncManager(
             if (!mergedData.isEmpty) {
                 val payload = buildPayload(mergedData)
                 logPayloadSummary(mergedData)
+                requireSyncOwner()
                 val sendResult = sendPayload(endpoint, payload)
+                requireSyncOwner()
 
                 if (!sendResult.success) {
                     val reason = sendResult.statusCode?.let { "HTTP $it" } ?: "network error"
@@ -413,8 +442,17 @@ class SyncManager(
             // Phase 3: Update progress for all types in this round
             val newlyCompletedTypes = mutableListOf<Pair<String, Int>>()
             stateMutex.withLock {
+                synchronized(SecureStorage.connectionLock) {
+                requireSyncOwner()
                 for (result in roundResults) {
                     updateInMemoryProgress(result.type, result.count, isComplete = result.isDone, anchorTimestamp = result.anchorTimestamp)
+                    if (result.nativePage) {
+                        inMemoryState?.typeProgress?.get(result.type)?.let { progress ->
+                            result.nextPageToken?.let { progress.nativeTokenHashes.add(nativeTokenHash(it)) }
+                            progress.nativePageToken = result.nextPageToken
+                            progress.nativePageCount += 1
+                        }
+                    }
                     if (fullExport && !result.isDone) {
                         inMemoryState?.typeProgress?.get(result.type)?.pendingOlderThan = result.nextCursor
                     }
@@ -423,6 +461,7 @@ class SyncManager(
                     }
                 }
                 persistStateToDisk()
+                }
             }
 
             val startTime = fullSyncStartTime
@@ -448,15 +487,54 @@ class SyncManager(
             val results = types.map { type ->
                 TypeResult(type, state?.completedTypes?.contains(type) == true, state?.typeProgress?.get(type)?.sentCount ?: 0)
             }
-            if (state?.fullExport == true) markFullExportDone()
-            if (state != null) logger("Sync: complete ($sent items, ${state.completedTypes.size} types)")
-            clearSyncSessionInternal()
+            synchronized(SecureStorage.connectionLock) {
+                requireSyncOwner()
+                if (state?.fullExport == true) markFullExportDone()
+                if (state != null) logger("Native traversal accepted ($sent items, ${state.completedTypes.size} types); server commit unverified")
+                clearSyncSessionInternal()
+            }
             Pair(sent, results)
         }
         return RoundRobinResult(true, totalSent, typeResults)
     }
 
     // MARK: - Fetch-Only Chunk Processors (no network)
+
+    /** Stable native query + opaque token. Only accepted rounds persist the next token/watermark. */
+    private fun nativeTokenHash(value: String): String = java.security.MessageDigest.getInstance("SHA-256")
+        .digest(value.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
+
+    private suspend fun fetchNativePage(type: String, fullExport: Boolean, limit: Int): FetchResult {
+        val (query, token) = stateMutex.withLock {
+            val state = inMemoryState ?: error("Native traversal has no owner state")
+            val progress = state.typeProgress.getOrPut(type) { TypeSyncProgress(type) }
+            check(progress.nativePageCount < 1000) { "Native traversal page budget exceeded; resume preserved" }
+            if (progress.queryStartMs == null) {
+                val floor = syncStartTimestamp() ?: 0L
+                progress.queryStartMs = if (fullExport) floor else maxOf(loadAnchors()[type] ?: floor, floor)
+                progress.queryEndMs = state.createdAt
+                progress.nativePageSize = minOf(limit, 200)
+                // Persist the query before a first page: resume must not move its time bounds.
+                persistStateToDisk()
+            }
+            Pair(ProviderPageQuery(progress.queryStartMs!!, progress.queryEndMs!!,
+                progress.nativePageSize!!, !fullExport), progress.nativePageToken)
+        }
+        requireSyncOwner()
+        val result = healthProvider.readPage(type, query, token)
+        requireSyncOwner()
+        check(result.nativePage && result.nativeRecordCount != null) { "Native page completion unavailable" }
+        check(result.data.totalCount <= 50000) { "Expanded sample budget exceeded; progress retained" }
+        val seen = inMemoryState?.typeProgress?.get(type)?.nativeTokenHashes ?: emptySet()
+        check(result.nextPageToken == null || (result.nextPageToken != token && nativeTokenHash(result.nextPageToken) !in seen)) {
+            "Native token cycle; progress retained"
+        }
+        val previousMax = inMemoryState?.typeProgress?.get(type)?.pendingAnchorTimestamp
+        val watermark = listOfNotNull(previousMax, result.maxTimestamp).maxOrNull()
+        return FetchResult(type, result.data, result.nativeRecordCount,
+            anchorTimestamp = watermark, isDone = result.nextPageToken == null,
+            nativePage = true, nextPageToken = result.nextPageToken)
+    }
 
     private suspend fun fetchOneChunkNewestFirst(
         type: String,
@@ -537,12 +615,15 @@ class SyncManager(
 
     // MARK: - Payload (unified)
 
-    private fun buildPayload(data: UnifiedHealthData): Map<String, Any> = mapOf(
+    private fun buildPayload(data: UnifiedHealthData): Map<String, Any> = mutableMapOf<String, Any>(
         "provider" to healthProvider.providerId,
         "sdkVersion" to SyncDefaults.SDK_VERSION,
         "syncTimestamp" to UnifiedTimestamp.fromEpochMs(System.currentTimeMillis()),
+        "syncType" to if (inMemoryState?.fullExport == true) "historical" else "live",
         "data" to data.toDataMap()
-    )
+    ).apply {
+        inMemoryState?.takeIf { it.fullExport }?.let { put("syncSessionId", it.syncSessionId) }
+    }
 
     // MARK: - Payload Summary Logging
 
@@ -653,17 +734,20 @@ class SyncManager(
     private suspend fun sendWithBody(endpoint: String, body: okhttp3.RequestBody): SendResult =
         withContext(dispatchers.io) {
             try {
+                val owner = requireSyncOwner()
                 val requestBuilder = Request.Builder()
                     .url(endpoint)
                     .post(body)
                     .header("Content-Type", "application/json")
-                applyAuth(requestBuilder)
-
+                secureStorage.withConnection(owner) { applyAuth(requestBuilder) }
+                    ?: error("Upload connection superseded")
+                requireSyncOwner()
                 val response = httpClient.newCall(requestBuilder.build()).execute()
                 val sizeKb = (response.header("Content-Length")?.toLongOrNull() ?: 0L) / 1024
                 val code = response.code
                 response.body?.close()
 
+                requireSyncOwner()
                 if (response.isSuccessful) return@withContext SendResult(true, code, sizeKb.toInt())
                 if (code == 401) {
                     logger("Got 401, refreshing token...")
@@ -679,6 +763,7 @@ class SyncManager(
         }
 
     private suspend fun handle401(endpoint: String, body: okhttp3.RequestBody): Boolean {
+        requireSyncOwner()
         if (secureStorage.isApiKeyAuth) {
             emitAuthError(401)
             return false
@@ -686,6 +771,7 @@ class SyncManager(
 
         when (attemptTokenRefresh()) {
             TokenRefreshResult.SUCCESS -> {
+                requireSyncOwner()
                 val newCredential = secureStorage.authCredential
                 if (newCredential != null) {
                     logger("Token refreshed, retrying...")
@@ -696,9 +782,11 @@ class SyncManager(
                             .header("Content-Type", "application/json")
                         applyAuth(retryBuilder, newCredential)
 
+                        requireSyncOwner()
                         val retryResponse = httpClient.newCall(retryBuilder.build()).execute()
                         val retryCode = retryResponse.code
                         retryResponse.body?.close()
+                        requireSyncOwner()
                         if (retryResponse.isSuccessful) {
                             logger("Retry: HTTP $retryCode")
                             true
@@ -715,6 +803,7 @@ class SyncManager(
                 return false
             }
             TokenRefreshResult.AUTH_FAILURE -> {
+                requireSyncOwner()
                 emitAuthError(401)
                 return false
             }
@@ -812,23 +901,24 @@ class SyncManager(
 
     private suspend fun countRecordsForTypes(types: List<String>, sinceTimestamp: Long?): Map<String, Int> {
         val counts = mutableMapOf<String, Int>()
+        val end = inMemoryState?.createdAt ?: error("Count has no owned query")
         for (type in types) {
-            try {
-                var count = 0
-                var cursor = sinceTimestamp
-                while (true) {
-                    val result = healthProvider.readData(type, cursor, 10000)
-                    count += result.data.totalCount
-                    if (result.data.totalCount < 10000 || result.maxTimestamp == null) break
-                    cursor = result.maxTimestamp
-                }
-                counts[type] = count
-            } catch (e: Exception) {
-                logger("Count failed for $type: ${e.message}")
-                counts[type] = 0
-            }
+            var count = 0
+            var token: String? = null
+            val seen = mutableSetOf<String>()
+            var pages = 0
+            do {
+                requireSyncOwner()
+                check(++pages <= 1000) { "Count traversal budget exceeded" }
+                val result = healthProvider.readPage(type, ProviderPageQuery(sinceTimestamp ?: 0L, end, 200, true), token)
+                requireSyncOwner()
+                check(result.nativePage && result.nativeRecordCount != null) { "Native count unavailable" }
+                count += result.nativeRecordCount
+                token = result.nextPageToken
+                check(token == null || seen.add(token)) { "Count traversal token cycle" }
+            } while (token != null)
+            counts[type] = count
         }
-        logger("Record counts: ${counts.entries.filter { it.value > 0 }.joinToString { "${it.key}=${it.value}" }}")
         return counts
     }
 
@@ -844,6 +934,7 @@ class SyncManager(
 
         val startEvent: Map<String, Any> = mapOf(
             "eventType" to "historical_data_sync_start",
+            "syncSessionId" to (inMemoryState?.syncSessionId ?: error("Historical session missing")),
             "timestamp" to dateFormatter.format(java.time.Instant.now()),
             "dataTypeCounts" to dataTypeCounts,
             "timeRange" to timeRange
@@ -861,6 +952,7 @@ class SyncManager(
     private suspend fun sendTypeEndLog(logsEndpoint: String, type: String, success: Boolean, recordCount: Int, durationMs: Int) {
         val endEvent: Map<String, Any> = mapOf(
             "eventType" to "historical_data_type_sync_end",
+            "syncSessionId" to (inMemoryState?.syncSessionId ?: error("Historical session missing")),
             "timestamp" to dateFormatter.format(java.time.Instant.now()),
             "dataType" to payloadTypeName(type),
             "success" to success,
@@ -884,8 +976,9 @@ class SyncManager(
                 .url(endpoint)
                 .post(requestBody)
                 .header("Content-Type", "application/json")
-            applyAuth(requestBuilder)
-
+            val owner = requireSyncOwner()
+            secureStorage.withConnection(owner) { applyAuth(requestBuilder) } ?: error("Log connection superseded")
+            requireSyncOwner()
             val response = httpClient.newCall(requestBuilder.build()).execute()
             response.body?.close()
             logger("Sync log: HTTP ${response.code}")
@@ -920,7 +1013,8 @@ class SyncManager(
         } catch (_: Exception) { emptyMap() }
     }
 
-    private fun saveAnchor(type: String, timestamp: Long) {
+    private fun saveAnchor(type: String, timestamp: Long) = synchronized(SecureStorage.connectionLock) {
+        requireSyncOwner()
         val current = loadAnchors().toMutableMap()
         current[type] = timestamp
         syncPrefs.edit().putString(
@@ -947,8 +1041,9 @@ class SyncManager(
     private fun syncStateDir(): File = File(context.filesDir, StorageKeys.SYNC_STATE_DIR).also { if (!it.exists()) it.mkdirs() }
     private fun syncStateFile(): File = File(syncStateDir(), StorageKeys.SYNC_STATE_FILE)
 
-    private fun persistStateToDisk() {
-        val state = inMemoryState ?: return
+    private fun persistStateToDisk() = synchronized(SecureStorage.connectionLock) {
+        requireSyncOwner()
+        val state = inMemoryState ?: return@synchronized
         try {
             val jsonStr = json.encodeToString(state)
             if (jsonStr.isNotBlank() && jsonStr.startsWith("{")) {

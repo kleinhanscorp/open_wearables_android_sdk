@@ -194,48 +194,56 @@ class HealthConnectManager(
         ascending = false
     )
 
+    override val supportsNativePages: Boolean get() = true
+
+    override suspend fun readPage(typeId: String, query: ProviderPageQuery, pageToken: String?): ProviderReadResult =
+        readRecordsInternal(typeId, if (query.ascending) query.startMs else null,
+            if (query.ascending) null else query.endMs, query.pageSize, query.ascending, query, pageToken)
+
     private suspend fun readRecordsInternal(
         typeId: String,
         sinceTimestamp: Long?,
         olderThanTimestamp: Long?,
         limit: Int,
-        ascending: Boolean
+        ascending: Boolean,
+        query: ProviderPageQuery? = null,
+        pageToken: String? = null
     ): ProviderReadResult = withContext(dispatchers.io) {
         if (client == null) withContext(dispatchers.main) { connect() }
-        val hcClient = client ?: return@withContext ProviderReadResult(UnifiedHealthData(), null, null)
+        val hcClient = client ?: throw IllegalStateException("Health Connect unavailable")
 
         try {
             when (typeId) {
-                "steps" -> readRecordType<StepsRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertSteps(it) }
-                "heartRate" -> readRecordType<HeartRateRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertHeartRate(it) }
-                "restingHeartRate" -> readRecordType<RestingHeartRateRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertRestingHeartRate(it) }
-                "heartRateVariabilitySDNN" -> readRecordType<HeartRateVariabilityRmssdRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertHrv(it) }
-                "oxygenSaturation" -> readRecordType<OxygenSaturationRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertOxygenSaturation(it) }
-                "bloodPressure", "bloodPressureSystolic", "bloodPressureDiastolic" -> readRecordType<BloodPressureRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertBloodPressure(it) }
-                "bloodGlucose" -> readRecordType<BloodGlucoseRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertBloodGlucose(it) }
-                "activeEnergy" -> readRecordType<ActiveCaloriesBurnedRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertActiveCalories(it) }
-                "basalEnergy" -> readRecordType<BasalMetabolicRateRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertBasalCalories(it) }
-                "bodyTemperature" -> readRecordType<BodyTemperatureRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertBodyTemperature(it) }
-                "bodyMass" -> readRecordType<WeightRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertWeight(it) }
-                "height" -> readRecordType<HeightRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertHeight(it) }
-                "bodyFatPercentage" -> readRecordType<BodyFatRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertBodyFat(it) }
-                "leanBodyMass" -> readRecordType<LeanBodyMassRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertLeanBodyMass(it) }
-                "flightsClimbed" -> readRecordType<FloorsClimbedRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertFloors(it) }
-                "distanceWalkingRunning" -> readRecordType<DistanceRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertDistance(it) }
-                "water", "dietaryWater" -> readRecordType<HydrationRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertHydration(it) }
-                "vo2Max" -> readRecordType<Vo2MaxRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertVo2Max(it) }
-                "respiratoryRate" -> readRecordType<RespiratoryRateRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertRespiratoryRate(it) }
-                "distanceCycling" -> readRecordType<DistanceRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp) { convertDistance(it) }
-                "workout" -> readWorkouts(hcClient, sinceTimestamp, limit, ascending, olderThanTimestamp)
-                "sleep" -> readSleep(hcClient, sinceTimestamp, limit, ascending, olderThanTimestamp)
+                "steps" -> readRecordType<StepsRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp, query, pageToken) { convertSteps(it) }
+                "heartRate" -> readRecordType<HeartRateRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp, query, pageToken) { convertHeartRate(it) }
+                "restingHeartRate" -> readRecordType<RestingHeartRateRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp, query, pageToken) { convertRestingHeartRate(it) }
+                "heartRateVariabilitySDNN" -> readRecordType<HeartRateVariabilityRmssdRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp, query, pageToken) { convertHrv(it) }
+                "oxygenSaturation" -> readRecordType<OxygenSaturationRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp, query, pageToken) { convertOxygenSaturation(it) }
+                "bloodPressure", "bloodPressureSystolic", "bloodPressureDiastolic" -> readRecordType<BloodPressureRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp, query, pageToken) { convertBloodPressure(it) }
+                "bloodGlucose" -> readRecordType<BloodGlucoseRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp, query, pageToken) { convertBloodGlucose(it) }
+                "activeEnergy" -> readRecordType<ActiveCaloriesBurnedRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp, query, pageToken) { convertActiveCalories(it) }
+                "basalEnergy" -> readRecordType<BasalMetabolicRateRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp, query, pageToken) { convertBasalCalories(it) }
+                "bodyTemperature" -> readRecordType<BodyTemperatureRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp, query, pageToken) { convertBodyTemperature(it) }
+                "bodyMass" -> readRecordType<WeightRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp, query, pageToken) { convertWeight(it) }
+                "height" -> readRecordType<HeightRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp, query, pageToken) { convertHeight(it) }
+                "bodyFatPercentage" -> readRecordType<BodyFatRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp, query, pageToken) { convertBodyFat(it) }
+                "leanBodyMass" -> readRecordType<LeanBodyMassRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp, query, pageToken) { convertLeanBodyMass(it) }
+                "flightsClimbed" -> readRecordType<FloorsClimbedRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp, query, pageToken) { convertFloors(it) }
+                "distanceWalkingRunning" -> readRecordType<DistanceRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp, query, pageToken) { convertDistance(it) }
+                "water", "dietaryWater" -> readRecordType<HydrationRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp, query, pageToken) { convertHydration(it) }
+                "vo2Max" -> readRecordType<Vo2MaxRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp, query, pageToken) { convertVo2Max(it) }
+                "respiratoryRate" -> readRecordType<RespiratoryRateRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp, query, pageToken) { convertRespiratoryRate(it) }
+                "distanceCycling" -> readRecordType<DistanceRecord>(hcClient, typeId, sinceTimestamp, limit, ascending, olderThanTimestamp, query, pageToken) { convertDistance(it) }
+                "workout" -> readWorkouts(hcClient, sinceTimestamp, limit, ascending, olderThanTimestamp, query, pageToken)
+                "sleep" -> readSleep(hcClient, sinceTimestamp, limit, ascending, olderThanTimestamp, query, pageToken)
                 else -> ProviderReadResult(UnifiedHealthData(), null, null)
             }
         } catch (e: SecurityException) {
-            logger("  $typeId: missing permission, skipping")
-            ProviderReadResult(UnifiedHealthData(), null, null)
+            logger("  $typeId: permission unavailable; preserving traversal")
+            throw e
         } catch (e: Exception) {
             logger("Failed to read $typeId from Health Connect: ${e.javaClass.simpleName}: ${e.message}")
-            ProviderReadResult(UnifiedHealthData(), null, null)
+            throw e
         }
     }
 
@@ -250,13 +258,15 @@ class HealthConnectManager(
         limit: Int,
         ascending: Boolean = true,
         olderThanTimestamp: Long? = null,
+        query: ProviderPageQuery? = null,
+        pageToken: String? = null,
         crossinline convert: (List<T>) -> ProviderReadResult
     ): ProviderReadResult {
-        val timeFilter = when {
+        val timeFilter = if (query != null) TimeRangeFilter.between(Instant.ofEpochMilli(query.startMs), Instant.ofEpochMilli(query.endMs)) else when {
             !ascending && olderThanTimestamp != null ->
                 TimeRangeFilter.before(Instant.ofEpochMilli(olderThanTimestamp))
             sinceTimestamp != null ->
-                TimeRangeFilter.after(Instant.ofEpochMilli(sinceTimestamp + 1))
+                TimeRangeFilter.after(Instant.ofEpochMilli(sinceTimestamp))
             else ->
                 TimeRangeFilter.before(Instant.now())
         }
@@ -265,11 +275,12 @@ class HealthConnectManager(
             recordType = T::class,
             timeRangeFilter = timeFilter,
             ascendingOrder = ascending,
-            pageSize = limit
+            pageSize = query?.pageSize ?: limit,
+            pageToken = pageToken
         )
 
         val response = client.readRecords(request)
-        if (response.records.isEmpty()) return ProviderReadResult(UnifiedHealthData(), null, null)
+        if (response.records.isEmpty()) return ProviderReadResult(UnifiedHealthData(), null, null, 0, response.pageToken, true)
 
         logger("Read ${response.records.size} ${T::class.simpleName} records${if (!ascending) " (newest first)" else ""}")
         val result = convert(response.records)
@@ -278,7 +289,7 @@ class HealthConnectManager(
             getRecordTimestamp(response.records.last())
         } else null
 
-        return ProviderReadResult(result.data, result.maxTimestamp, minTs)
+        return ProviderReadResult(result.data, result.maxTimestamp, minTs, response.records.size, response.pageToken, true)
     }
 
     private fun getRecordTimestamp(record: Record): Long? = when (record) {
@@ -605,13 +616,15 @@ class HealthConnectManager(
         sinceTimestamp: Long?,
         limit: Int,
         ascending: Boolean = true,
-        olderThanTimestamp: Long? = null
+        olderThanTimestamp: Long? = null,
+        query: ProviderPageQuery? = null,
+        pageToken: String? = null
     ): ProviderReadResult {
-        val timeFilter = when {
+        val timeFilter = if (query != null) TimeRangeFilter.between(Instant.ofEpochMilli(query.startMs), Instant.ofEpochMilli(query.endMs)) else when {
             !ascending && olderThanTimestamp != null ->
                 TimeRangeFilter.before(Instant.ofEpochMilli(olderThanTimestamp))
             sinceTimestamp != null ->
-                TimeRangeFilter.after(Instant.ofEpochMilli(sinceTimestamp + 1))
+                TimeRangeFilter.after(Instant.ofEpochMilli(sinceTimestamp))
             else ->
                 TimeRangeFilter.before(Instant.now())
         }
@@ -621,10 +634,11 @@ class HealthConnectManager(
                 recordType = ExerciseSessionRecord::class,
                 timeRangeFilter = timeFilter,
                 ascendingOrder = ascending,
-                pageSize = limit
+                pageSize = query?.pageSize ?: limit,
+            pageToken = pageToken
             )
         )
-        if (response.records.isEmpty()) return ProviderReadResult(UnifiedHealthData(), null, null)
+        if (response.records.isEmpty()) return ProviderReadResult(UnifiedHealthData(), null, null, 0, response.pageToken, true)
 
         var maxTs: Long? = null
         val workouts = response.records.map { r ->
@@ -693,7 +707,7 @@ class HealthConnectManager(
             response.records.last().endTime.toEpochMilli()
         } else null
 
-        return ProviderReadResult(UnifiedHealthData(workouts = workouts), maxTs, minTs)
+        return ProviderReadResult(UnifiedHealthData(workouts = workouts), maxTs, minTs, response.records.size, response.pageToken, true)
     }
 
     private fun mapSegmentType(type: Int): String = when (type) {
@@ -785,13 +799,15 @@ class HealthConnectManager(
         sinceTimestamp: Long?,
         limit: Int,
         ascending: Boolean = true,
-        olderThanTimestamp: Long? = null
+        olderThanTimestamp: Long? = null,
+        query: ProviderPageQuery? = null,
+        pageToken: String? = null
     ): ProviderReadResult {
-        val timeFilter = when {
+        val timeFilter = if (query != null) TimeRangeFilter.between(Instant.ofEpochMilli(query.startMs), Instant.ofEpochMilli(query.endMs)) else when {
             !ascending && olderThanTimestamp != null ->
                 TimeRangeFilter.before(Instant.ofEpochMilli(olderThanTimestamp))
             sinceTimestamp != null ->
-                TimeRangeFilter.after(Instant.ofEpochMilli(sinceTimestamp + 1))
+                TimeRangeFilter.after(Instant.ofEpochMilli(sinceTimestamp))
             else ->
                 TimeRangeFilter.before(Instant.now())
         }
@@ -801,10 +817,11 @@ class HealthConnectManager(
                 recordType = SleepSessionRecord::class,
                 timeRangeFilter = timeFilter,
                 ascendingOrder = ascending,
-                pageSize = limit
+                pageSize = query?.pageSize ?: limit,
+            pageToken = pageToken
             )
         )
-        if (response.records.isEmpty()) return ProviderReadResult(UnifiedHealthData(), null)
+        if (response.records.isEmpty()) return ProviderReadResult(UnifiedHealthData(), null, null, 0, response.pageToken, true)
 
         var maxTs: Long? = null
         val sleepEntries = mutableListOf<UnifiedSleep>()
@@ -851,7 +868,7 @@ class HealthConnectManager(
             response.records.last().endTime.toEpochMilli()
         } else null
 
-        return ProviderReadResult(UnifiedHealthData(sleep = sleepEntries), maxTs, minTs)
+        return ProviderReadResult(UnifiedHealthData(sleep = sleepEntries), maxTs, minTs, response.records.size, response.pageToken, true)
     }
 
     private fun mapSleepStage(stage: Int): String = when (stage) {
