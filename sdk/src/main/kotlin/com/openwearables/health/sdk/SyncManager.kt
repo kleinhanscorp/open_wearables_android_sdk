@@ -44,6 +44,7 @@ data class SyncState(
     val fullExport: Boolean,
     val createdAt: Long,
     val connectionGeneration: String? = null,
+    val queryFloorMs: Long? = null,
     val syncSessionId: String = java.util.UUID.randomUUID().toString(),
     var typeProgress: MutableMap<String, TypeSyncProgress> = mutableMapOf(),
     var totalSentCount: Int = 0,
@@ -170,11 +171,15 @@ class SyncManager(
     }
 
     private fun emitAuthError(statusCode: Int) {
+        val owner = syncOwner ?: return
+        synchronized(SecureStorage.connectionLock) {
+            if (!secureStorage.isCurrent(owner)) return
         logger("Auth error: HTTP $statusCode - token invalid")
         // Persist the verdict FIRST: the host may not be alive to receive the callback (this can run
         // inside HealthSyncWorker at 04:00), but it will read `getAuthState()` at its next launch.
         authRecovery.markReauthRequired()
         onAuthError?.invoke(statusCode, "Unauthorized - please re-authenticate")
+        }
     }
 
     fun retryOutboxIfPossible() { /* reserved for future use */ }
@@ -285,7 +290,7 @@ class SyncManager(
                 stateMutex.withLock {
                     inMemoryState = SyncState(
                         userKey = userKey(), fullExport = effectiveFullExport,
-                        createdAt = System.currentTimeMillis(), connectionGeneration = owner.generation
+                        createdAt = System.currentTimeMillis(), connectionGeneration = owner.generation, queryFloorMs = floor
                     )
                     persistStateToDisk()
                 }
@@ -299,9 +304,10 @@ class SyncManager(
                 currentLogsEndpoint = logsEndpoint
                 try {
                     logger("Counting records for sync start log...")
-                    val typeCounts = countRecordsForTypes(trackedTypes, floor)
+                    val stableFloor = inMemoryState?.queryFloorMs
+                    val typeCounts = countRecordsForTypes(trackedTypes, stableFloor)
                     logger("Sending sync start log to $logsEndpoint")
-                    sendSyncStartLog(logsEndpoint, trackedTypes, typeCounts, floor)
+                    sendSyncStartLog(logsEndpoint, trackedTypes, typeCounts, stableFloor)
                 } catch (e: Exception) {
                     logger("Sync start log failed: ${e.message}")
                 }
@@ -510,7 +516,7 @@ class SyncManager(
             val progress = state.typeProgress.getOrPut(type) { TypeSyncProgress(type) }
             check(progress.nativePageCount < 1000) { "Native traversal page budget exceeded; resume preserved" }
             if (progress.queryStartMs == null) {
-                val floor = syncStartTimestamp() ?: 0L
+                val floor = state.queryFloorMs ?: 0L
                 progress.queryStartMs = if (fullExport) floor else maxOf(loadAnchors()[type] ?: floor, floor)
                 progress.queryEndMs = state.createdAt
                 progress.nativePageSize = minOf(limit, 200)
@@ -926,7 +932,7 @@ class SyncManager(
         val dataTypeCounts = types.map { mapOf("type" to payloadTypeName(it), "count" to (typeCounts[it] ?: 0)) }
 
         val timeRange = mutableMapOf<String, String>(
-            "endDate" to dateFormatter.format(java.time.Instant.now())
+            "endDate" to dateFormatter.format(java.time.Instant.ofEpochMilli(inMemoryState?.createdAt ?: error("Historical query unavailable")))
         )
         startTimestamp?.let {
             timeRange["startDate"] = dateFormatter.format(java.time.Instant.ofEpochMilli(it))
@@ -943,6 +949,8 @@ class SyncManager(
         val body: Map<String, Any> = mapOf(
             "sdkVersion" to SyncDefaults.SDK_VERSION,
             "provider" to healthProvider.providerId,
+            "syncType" to "historical",
+            "syncSessionId" to (inMemoryState?.syncSessionId ?: error("Historical session missing")),
             "events" to listOf(startEvent, collectDeviceState())
         )
 
@@ -963,6 +971,8 @@ class SyncManager(
         val body: Map<String, Any> = mapOf(
             "sdkVersion" to SyncDefaults.SDK_VERSION,
             "provider" to healthProvider.providerId,
+            "syncType" to "historical",
+            "syncSessionId" to (inMemoryState?.syncSessionId ?: error("Historical session missing")),
             "events" to listOf(endEvent, collectDeviceState())
         )
 

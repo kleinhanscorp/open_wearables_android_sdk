@@ -130,6 +130,7 @@ internal class AuthRecovery(
                         val text = response.body?.string()
                         storage.withConnection(owner) {
                             if (response.code == 401 || response.code == 403 || response.code == 410) {
+                                storage.setDeviceLeaseRejected(true)
                                 markReauthRequired(); storage.invalidateConnection(); false
                             } else if (response.isSuccessful && text != null) {
                                 val json = JSONObject(text)
@@ -159,6 +160,7 @@ internal class AuthRecovery(
     /** Snapshot for bridges. No network. */
     fun getAuthState(): Map<String, Any?> = mapOf(
         "state" to storage.getAuthState(),
+        "deviceLeaseRejected" to storage.deviceLeaseRejected(),
         "lastAuthErrorAt" to iso(storage.getLastAuthErrorAt()),
         "lastRecoveredAt" to iso(storage.getLastRecoveredAt()),
         "hasRenewalCredential" to storage.hasRenewalCredential(),

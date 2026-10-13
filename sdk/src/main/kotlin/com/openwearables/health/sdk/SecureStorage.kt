@@ -148,6 +148,8 @@ class SecureStorage(private val context: Context) {
         }
     }
 
+    fun deviceLeaseRejected(): Boolean = configPrefs.getBoolean("deviceLeaseRejected", false)
+    fun setDeviceLeaseRejected(value: Boolean) { check(configPrefs.edit().putBoolean("deviceLeaseRejected", value).commit()) }
     fun deviceConnectionGeneration(): String? = configPrefs.getString("deviceConnectionGeneration", null)
     fun setDeviceConnectionGeneration(value: String) {
         check(configPrefs.edit().putString("deviceConnectionGeneration", value).commit())

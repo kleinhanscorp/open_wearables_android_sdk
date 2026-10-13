@@ -218,6 +218,7 @@ class OpenWearablesHealthSDK private constructor(
         // A fresh sign-in supersedes any renewal credential and any prior verdict.
         secureStorage.clearRenewalCredential()
         secureStorage.clearAuthLedger()
+        secureStorage.setDeviceLeaseRejected(false)
 
         secureStorage.saveCredentials(userId, accessToken, refreshToken)
         if (apiKey != null) {

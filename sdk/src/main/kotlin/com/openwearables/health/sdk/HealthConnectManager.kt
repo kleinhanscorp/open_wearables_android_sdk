@@ -834,8 +834,8 @@ class HealthConnectManager(
                 val parentId = r.metadata.id
 
                 val stages = try { r.stages } catch (e: Exception) {
-                    logger("  Failed to read stages for $parentId: ${e.message}")
-                    emptyList()
+                    logger("  Sleep stages unavailable; refusing query progress")
+                    throw e
                 }
 
                 if (stages.isEmpty()) {
@@ -860,7 +860,8 @@ class HealthConnectManager(
                     }
                 }
             } catch (e: Exception) {
-                logger("  Failed to process sleep session: ${e.message}")
+                logger("  Sleep conversion unavailable; refusing query progress")
+                throw e
             }
         }
 
