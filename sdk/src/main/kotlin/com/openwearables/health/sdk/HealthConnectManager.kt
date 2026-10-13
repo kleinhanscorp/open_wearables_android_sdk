@@ -280,7 +280,7 @@ class HealthConnectManager(
         )
 
         val response = client.readRecords(request)
-        if (response.records.isEmpty()) return ProviderReadResult(UnifiedHealthData(), null, null, 0, response.pageToken, true)
+        if (response.records.isEmpty()) return ProviderReadResult(UnifiedHealthData(), null, null, 0, response.pageToken?.takeIf { it.isNotEmpty() }, true)
 
         logger("Read ${response.records.size} ${T::class.simpleName} records${if (!ascending) " (newest first)" else ""}")
         val result = convert(response.records)
@@ -289,7 +289,7 @@ class HealthConnectManager(
             getRecordTimestamp(response.records.last())
         } else null
 
-        return ProviderReadResult(result.data, result.maxTimestamp, minTs, response.records.size, response.pageToken, true)
+        return ProviderReadResult(result.data, result.maxTimestamp, minTs, response.records.size, response.pageToken?.takeIf { it.isNotEmpty() }, true)
     }
 
     private fun getRecordTimestamp(record: Record): Long? = when (record) {
@@ -638,7 +638,7 @@ class HealthConnectManager(
             pageToken = pageToken
             )
         )
-        if (response.records.isEmpty()) return ProviderReadResult(UnifiedHealthData(), null, null, 0, response.pageToken, true)
+        if (response.records.isEmpty()) return ProviderReadResult(UnifiedHealthData(), null, null, 0, response.pageToken?.takeIf { it.isNotEmpty() }, true)
 
         var maxTs: Long? = null
         val workouts = response.records.map { r ->
@@ -707,7 +707,7 @@ class HealthConnectManager(
             response.records.last().endTime.toEpochMilli()
         } else null
 
-        return ProviderReadResult(UnifiedHealthData(workouts = workouts), maxTs, minTs, response.records.size, response.pageToken, true)
+        return ProviderReadResult(UnifiedHealthData(workouts = workouts), maxTs, minTs, response.records.size, response.pageToken?.takeIf { it.isNotEmpty() }, true)
     }
 
     private fun mapSegmentType(type: Int): String = when (type) {
@@ -821,7 +821,7 @@ class HealthConnectManager(
             pageToken = pageToken
             )
         )
-        if (response.records.isEmpty()) return ProviderReadResult(UnifiedHealthData(), null, null, 0, response.pageToken, true)
+        if (response.records.isEmpty()) return ProviderReadResult(UnifiedHealthData(), null, null, 0, response.pageToken?.takeIf { it.isNotEmpty() }, true)
 
         var maxTs: Long? = null
         val sleepEntries = mutableListOf<UnifiedSleep>()
@@ -869,7 +869,7 @@ class HealthConnectManager(
             response.records.last().endTime.toEpochMilli()
         } else null
 
-        return ProviderReadResult(UnifiedHealthData(sleep = sleepEntries), maxTs, minTs, response.records.size, response.pageToken, true)
+        return ProviderReadResult(UnifiedHealthData(sleep = sleepEntries), maxTs, minTs, response.records.size, response.pageToken?.takeIf { it.isNotEmpty() }, true)
     }
 
     private fun mapSleepStage(stage: Int): String = when (stage) {
