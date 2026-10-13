@@ -213,7 +213,6 @@ class OpenWearablesHealthSDK private constructor(
         secureStorage.invalidateConnection()
         val sm = ensureSyncManager()
         sm.clearSyncSession()
-        sm.resetAnchors()
 
         // A fresh sign-in supersedes any renewal credential and any prior verdict.
         secureStorage.clearRenewalCredential()
@@ -226,24 +225,31 @@ class OpenWearablesHealthSDK private constructor(
             logMessage("API key saved")
         }
 
+        check(secureStorage.getUserId() == userId &&
+            (accessToken == null || secureStorage.getAccessToken() == accessToken) &&
+            (refreshToken == null || secureStorage.getRefreshToken() == refreshToken))
+        sm.resetAnchors() // reset the incoming owner's completion marker, after identity installation
+        secureStorage.setConnectionBlocked(false)
         logMessage("Signed in: userId=$userId, mode=${if (accessToken != null) "token" else "apiKey"}")
         }
     }
 
     fun signOut() = synchronized(SecureStorage.connectionLock) {
-        secureStorage.invalidateConnection()
-        logMessage("Signing out")
-        // Before storage is wiped: tell the server this refresh token is done (fire-and-forget).
-        authRecovery.revokeRefreshTokenBestEffort()
-        val sm = ensureSyncManager()
-        sm.stopBackgroundSync()
-        sm.resetAnchors()
-        sm.clearSyncSession()
-        activeProvider?.disconnect()
-        secureStorage.clearAll()
-        activeProvider = null
-        syncManager = null
-        logMessage("Sign out complete")
+        secureStorage.invalidateConnection() // persisted refusal of new work, before any cleanup
+        try { authRecovery.revokeRefreshTokenBestEffort() } catch (_: Exception) { }
+        try {
+            secureStorage.clearAll() // forget credentials even if scheduler/provider cleanup fails
+            check(secureStorage.getUserId() == null && secureStorage.getAccessToken() == null &&
+                secureStorage.getRefreshToken() == null && secureStorage.getApiKey() == null &&
+                secureStorage.getRenewalToken() == null)
+        } finally {
+            val sm = syncManager
+            try { sm?.stopBackgroundSync() } catch (_: Exception) { logMessage("Periodic cancellation unconfirmed") }
+            try { sm?.resetAnchors(); sm?.clearSyncSession() } catch (_: Exception) { logMessage("Local sync cleanup unconfirmed") }
+            try { activeProvider?.disconnect() } catch (_: Exception) { logMessage("Local provider cleanup unconfirmed") }
+            activeProvider = null; syncManager = null
+        }
+        logMessage("Native credentials cleared; accepted upstream work remains separate")
     }
 
     fun invalidateConnection(): String = secureStorage.invalidateConnection()
@@ -258,11 +264,19 @@ class OpenWearablesHealthSDK private constructor(
             if (fresh) signIn(userId, access, refresh, null)
             else {
                 if (secureStorage.getUserId() != userId) return@synchronized null
-                updateTokens(access, refresh)
+                updateTokens(access, refresh, triggerRetry = false)
             }
-            if (renewalUrl != null && renewalToken != null) authRecovery.setRenewalCredential(renewalUrl, renewalToken)
+            if (renewalUrl != null && renewalToken != null) {
+                authRecovery.setRenewalCredential(renewalUrl, renewalToken)
+                if (secureStorage.getRenewalUrl() != renewalUrl || secureStorage.getRenewalToken() != renewalToken) {
+                    secureStorage.setConnectionBlocked(true)
+                    return@synchronized null
+                }
+            }
             if (secureStorage.getAccessToken() != access || secureStorage.getRefreshToken() != refresh) return@synchronized null
             secureStorage.setDeviceConnectionGeneration(deviceGeneration)
+            secureStorage.setConnectionBlocked(false)
+            ensureSyncManager().retryOutboxIfPossible()
             secureStorage.connectionGeneration()
         }
 
@@ -287,22 +301,23 @@ class OpenWearablesHealthSDK private constructor(
     fun isSyncActive(): Boolean = secureStorage.isSyncActive()
 
     /** Gutsy fork: also lifts any `recovering` / `reauth_required` verdict — the host has repaired us. */
-    fun updateTokens(accessToken: String, refreshToken: String?) = synchronized(SecureStorage.connectionLock) {
+    fun updateTokens(accessToken: String, refreshToken: String?, triggerRetry: Boolean = true) = synchronized(SecureStorage.connectionLock) {
         secureStorage.invalidateConnection()
         val persisted = secureStorage.updateTokens(accessToken, refreshToken)
         logMessage(if (persisted) "Tokens updated" else "Tokens updated but storage verification failed")
         if (!persisted) return@synchronized
+        secureStorage.setConnectionBlocked(false)
         secureStorage.setRenewalFailures(0)
         authRecovery.markAuthOk("external")
-        ensureSyncManager().retryOutboxIfPossible()
+        if (triggerRetry) ensureSyncManager().retryOutboxIfPossible()
     }
 
     fun getStoredCredentials(): Map<String, Any?> = mapOf(
-        "userId" to secureStorage.getUserId(),
+        "userId" to if (secureStorage.connectionBlocked()) null else secureStorage.getUserId(),
         "deviceConnectionGeneration" to secureStorage.deviceConnectionGeneration(),
-        "accessToken" to secureStorage.getAccessToken(),
-        "refreshToken" to secureStorage.getRefreshToken(),
-        "apiKey" to secureStorage.getApiKey(),
+        "accessToken" to if (secureStorage.connectionBlocked()) null else secureStorage.getAccessToken(),
+        "refreshToken" to if (secureStorage.connectionBlocked()) null else secureStorage.getRefreshToken(),
+        "apiKey" to if (secureStorage.connectionBlocked()) null else secureStorage.getApiKey(),
         "host" to secureStorage.getHost(),
         "customSyncUrl" to secureStorage.getCustomSyncUrl(),
         "isSyncActive" to secureStorage.isSyncActive(),

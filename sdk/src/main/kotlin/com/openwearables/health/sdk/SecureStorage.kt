@@ -133,15 +133,19 @@ class SecureStorage(private val context: Context) {
     internal data class ConnectionOwner(val userId: String?, val generation: String)
 
     fun connectionGeneration(): String = synchronized(connectionLock) {
-        configPrefs.getString(KEY_CONNECTION_GENERATION, null) ?: invalidateConnection()
+        configPrefs.getString(KEY_CONNECTION_GENERATION, null) ?: java.util.UUID.randomUUID().toString().also {
+            check(configPrefs.edit().putString(KEY_CONNECTION_GENERATION, it).commit())
+        }
     }
 
     fun invalidateConnection(): String = synchronized(connectionLock) {
         val value = java.util.UUID.randomUUID().toString()
-        check(configPrefs.edit().putString(KEY_CONNECTION_GENERATION, value).commit())
+        check(configPrefs.edit().putString(KEY_CONNECTION_GENERATION, value).putBoolean("connectionBlocked", true).commit())
         value
     }
 
+    fun connectionBlocked(): Boolean = configPrefs.getBoolean("connectionBlocked", false)
+    fun setConnectionBlocked(value: Boolean) { check(configPrefs.edit().putBoolean("connectionBlocked", value).commit()) }
     fun deviceId(): String = synchronized(connectionLock) {
         configPrefs.getString(KEY_DEVICE_ID, null) ?: java.util.UUID.randomUUID().toString().also {
             check(configPrefs.edit().putString(KEY_DEVICE_ID, it).commit())
@@ -158,7 +162,7 @@ class SecureStorage(private val context: Context) {
         ConnectionOwner(getUserId(), connectionGeneration())
     }
     internal fun isCurrent(owner: ConnectionOwner) = synchronized(connectionLock) {
-        owner.generation == connectionGeneration() && owner.userId == getUserId()
+        !connectionBlocked() && owner.generation == connectionGeneration() && owner.userId == getUserId()
     }
     internal fun <T> withConnection(owner: ConnectionOwner, action: () -> T): T? = synchronized(connectionLock) {
         if (isCurrent(owner)) action() else null
@@ -181,6 +185,7 @@ class SecureStorage(private val context: Context) {
     fun getUserId(): String? = securePrefs.getString(KEY_USER_ID, null)
 
     fun hasSession(): Boolean {
+        if (connectionBlocked()) return false
         val userId = getUserId() ?: return false
         return getAccessToken() != null || getApiKey() != null
     }
@@ -392,7 +397,7 @@ class SecureStorage(private val context: Context) {
         // Remove credential keys individually — EncryptedSharedPreferences.clear()
         // has a known Android bug where it can leave orphan encrypted entries,
         // causing hasSession() to return stale data after sign-out.
-        securePrefs.edit()
+        val credentialsCleared = securePrefs.edit()
             .remove(KEY_ACCESS_TOKEN)
             .remove(KEY_REFRESH_TOKEN)
             .remove(KEY_USER_ID)
@@ -404,8 +409,9 @@ class SecureStorage(private val context: Context) {
         // clear() also wipes the auth ledger (config prefs) — a sign-out is a clean slate.
         val generation = connectionGeneration()
         val device = deviceId()
-        configPrefs.edit().clear().putString(KEY_CONNECTION_GENERATION, generation)
-            .putString(KEY_DEVICE_ID, device).commit()
-        configPrefs.edit().putBoolean(KEY_APP_INSTALLED, true).commit()
+        val configCleared = configPrefs.edit().clear().putString(KEY_CONNECTION_GENERATION, generation)
+            .putString(KEY_DEVICE_ID, device).putBoolean("connectionBlocked", true)
+            .putBoolean(KEY_APP_INSTALLED, true).commit()
+        check(credentialsCleared && configCleared) { "Native credential clear could not be confirmed" }
     }
 }

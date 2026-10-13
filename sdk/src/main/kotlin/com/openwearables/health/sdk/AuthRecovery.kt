@@ -164,9 +164,9 @@ internal class AuthRecovery(
         "deviceLeaseRejected" to storage.deviceLeaseRejected(),
         "lastAuthErrorAt" to iso(storage.getLastAuthErrorAt()),
         "lastRecoveredAt" to iso(storage.getLastRecoveredAt()),
-        "hasRenewalCredential" to storage.hasRenewalCredential(),
+        "hasRenewalCredential" to (!storage.connectionBlocked() && storage.hasRenewalCredential()),
         "renewalFailures" to storage.getRenewalFailures(),
-        "accessTokenExpiresAt" to iso(accessTokenExpiryMs() ?: 0L),
+        "accessTokenExpiresAt" to if (storage.connectionBlocked()) null else iso(accessTokenExpiryMs() ?: 0L),
         "hasSession" to storage.hasSession()
     )
 
