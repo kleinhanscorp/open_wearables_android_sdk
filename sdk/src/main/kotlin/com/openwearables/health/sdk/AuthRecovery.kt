@@ -76,9 +76,8 @@ internal class AuthRecovery(
     // ───────────────────────────── Public surface (via the SDK) ─────────────────────────────
 
     /** Refresh under the process-wide lock, walking the recovery ladder on rejection. */
-    suspend fun refreshTokens(): Result {
-        // Capture BEFORE waiting: an old waiter may not adopt the replacement member's pair.
-        val owner = storage.connectionOwner()
+    suspend fun refreshTokens(owner: SecureStorage.ConnectionOwner = storage.connectionOwner()): Result {
+        // Owner is captured BEFORE waiting, including the caller's bridge fence.
         return refreshMutex.withLock {
             if (!storage.isCurrent(owner)) return@withLock Result.NETWORK_ERROR
             withContext(ioDispatcher) { refreshLocked(owner) }
@@ -89,21 +88,23 @@ internal class AuthRecovery(
      * Prove — or repair — the session now. Returns "ok" · "refreshed" · "recovered" ·
      * "reauth_required" · "network_error".
      */
-    suspend fun ensureFreshSession(): String {
-        val state = storage.getAuthState()
-        val exp = accessTokenExpiryMs()
-        if (state != STATE_REAUTH_REQUIRED && exp != null && exp - System.currentTimeMillis() > FRESHNESS_HORIZON_MS) {
-            return "ok"
-        }
-        val recoveredBefore = storage.getLastRecoveredAt()
-        return when (refreshTokens()) {
-            Result.SUCCESS -> {
-                val recoveredAfter = storage.getLastRecoveredAt()
-                if (recoveredAfter > 0L && recoveredAfter != recoveredBefore) "recovered" else "refreshed"
+    suspend fun ensureFreshSession(owner: SecureStorage.ConnectionOwner = storage.connectionOwner()): String {
+        val before = storage.withConnection(owner) {
+            Triple(storage.getAuthState(), accessTokenExpiryMs(), storage.getLastRecoveredAt())
+        } ?: return "network_error"
+        if (before.first != STATE_REAUTH_REQUIRED && before.second != null &&
+            before.second!! - System.currentTimeMillis() > FRESHNESS_HORIZON_MS) return "ok"
+        val result = refreshTokens(owner)
+        return storage.withConnection(owner) {
+            when (result) {
+                Result.SUCCESS -> {
+                    val recoveredAfter = storage.getLastRecoveredAt()
+                    if (recoveredAfter > 0L && recoveredAfter != before.third) "recovered" else "refreshed"
+                }
+                Result.AUTH_FAILURE -> "reauth_required"
+                Result.NETWORK_ERROR -> "network_error"
             }
-            Result.AUTH_FAILURE -> "reauth_required"
-            Result.NETWORK_ERROR -> "network_error"
-        }
+        } ?: "network_error"
     }
 
     /** Verify this device lease before new upload work. Does not rotate/mint tokens. */

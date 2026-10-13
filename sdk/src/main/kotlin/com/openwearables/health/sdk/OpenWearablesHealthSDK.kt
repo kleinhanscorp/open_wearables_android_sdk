@@ -332,11 +332,13 @@ class OpenWearablesHealthSDK private constructor(
      * Prove — or repair — the session on the host's schedule. Returns "ok" · "refreshed" ·
      * "recovered" · "reauth_required" · "network_error" · "no_session" · "api_key".
      */
-    suspend fun ensureFreshSession(): String {
+    suspend fun ensureFreshSession(expectedGeneration: String? = null): String {
+        val owner = secureStorage.connectionOwner()
+        if (expectedGeneration != null && expectedGeneration != owner.generation) return "network_error"
         if (secureStorage.getUserId() == null || !secureStorage.hasAuth) return "no_session"
         if (secureStorage.isApiKeyAuth) return "api_key"
-        val outcome = authRecovery.ensureFreshSession()
-        if (outcome == "refreshed" || outcome == "recovered") {
+        val outcome = authRecovery.ensureFreshSession(owner)
+        if (secureStorage.isCurrent(owner) && (outcome == "refreshed" || outcome == "recovered")) {
             ensureSyncManager().retryOutboxIfPossible()
         }
         return outcome

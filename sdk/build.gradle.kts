@@ -68,6 +68,8 @@ dependencies {
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
     // Testing
+    // Real JSONObject for JVM auth-boundary tests; Android's mockable stub throws on construction.
+    testImplementation("org.json:json:20240303")
     testImplementation("org.jetbrains.kotlin:kotlin-test")
     testImplementation("io.mockk:mockk:1.13.13")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.7.3")
