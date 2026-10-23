@@ -8,6 +8,9 @@ import io.mockk.mockk
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Protocol
@@ -76,9 +79,13 @@ internal object TestDispatchers : DispatcherProvider {
     override val default: CoroutineDispatcher = Dispatchers.Default
 }
 
+/** An interval record with a stable id (GUT-217), e.g. Samsung Health's midnight-to-midnight steps total. */
+internal data class Span(val id: String, val startMs: Long, val endMs: Long, val value: Double = 1.0)
+
 /**
  * A native-paging provider over synthetic timestamps. Pages honour the query's bounds and page
- * size like Health Connect (start inclusive), so rollover and resume behave as on a device.
+ * size like Health Connect (selected by start, inclusive), so rollover and resume behave as on a
+ * device, and an empty or inverted window throws as `TimeRangeFilter.between` does.
  * Grants and readers are explicit; [aliasReader] maps ids that share one reader.
  */
 internal class FakeProvider(
@@ -89,10 +96,17 @@ internal class FakeProvider(
 ) : HealthDataProvider {
     override val providerId = ProviderIds.GOOGLE
     override val providerName = "Fake Health Connect"
-    override val supportsNativePages: Boolean get() = true
+    /** false = the Samsung Health path: [readData] from a since-cursor instead of native pages. */
+    @Volatile var nativePages = true
+    override val supportsNativePages: Boolean get() = nativePages
 
     private var trackedIds = tracked.toSet()
     val data: MutableMap<String, List<Long>> = Collections.synchronizedMap(mutableMapOf())
+    /** Interval records per type; a type listed here is read from its spans, not from [data]. */
+    val spans: MutableMap<String, List<Span>> = Collections.synchronizedMap(mutableMapOf())
+    /** Every span id handed to the run, in order (upload bodies are empty under the JsonWriter stub). */
+    val served: MutableList<String> = Collections.synchronizedList(mutableListOf())
+    val queries: MutableList<Pair<String, ProviderPageQuery>> = Collections.synchronizedList(mutableListOf())
     val failures: MutableMap<String, () -> Throwable> = Collections.synchronizedMap(mutableMapOf())
     val reads: MutableList<String> = Collections.synchronizedList(mutableListOf())
     @Volatile var hold: CompletableDeferred<Unit>? = null
@@ -111,7 +125,16 @@ internal class FakeProvider(
     override fun setTrackedTypes(typeIds: List<String>) { trackedIds = typeIds.toSet() }
     override fun getTrackedTypes(): Set<String> = trackedIds
     override suspend fun requestAuthorization(typeIds: List<String>) = true
-    override suspend fun readData(typeId: String, sinceTimestamp: Long?, limit: Int) = error("native pages only")
+    override suspend fun readData(typeId: String, sinceTimestamp: Long?, limit: Int): ProviderReadResult {
+        check(!nativePages) { "native pages only" }
+        reads.add(typeId)
+        // Samsung Health reads (since, now]; a cursor at or past now is an inverted window.
+        require(sinceTimestamp == null || sinceTimestamp + 1 < System.currentTimeMillis()) { "end time needs be after start time" }
+        val page = (spans[typeId] ?: emptyList()).filter { sinceTimestamp == null || it.startMs > sinceTimestamp }
+            .sortedBy { it.startMs }.take(limit)
+        page.forEach { served.add(it.id) }
+        return ProviderReadResult(UnifiedHealthData(records = page.map { spanRecord(typeId, it) }), page.maxOfOrNull { it.endMs })
+    }
 
     override suspend fun resolveReadableTypes(typeIds: Collection<String>): TypeReadability =
         if (claimAllReadable) TypeReadability.all(typeIds) else SyncPolicy.resolveReadable(typeIds.toList(), { if (it in readers) reader(it) else null }, { "read:${reader(it)}" },
@@ -122,9 +145,12 @@ internal class FakeProvider(
         synchronized(this) { maxActive = maxOf(maxActive, now) }
         try {
             reads.add(typeId)
+            queries.add(typeId to query)
             hold?.let { entered.complete(Unit); it.await() }
             failures[typeId]?.let { throw it() }
             if (typeId !in readers) return ProviderReadResult(UnifiedHealthData(), null, null)
+            require(query.startMs < query.endMs) { "end time needs be after start time" }
+            spans[typeId]?.let { return spanPage(typeId, it, query, pageToken) }
             val inRange = (data[typeId] ?: emptyList()).filter { it >= query.startMs && it < query.endMs }
                 .let { if (query.ascending) it.sorted() else it.sortedDescending() }
             val offset = pageToken?.toInt() ?: 0
@@ -137,6 +163,23 @@ internal class FakeProvider(
             active.decrementAndGet()
         }
     }
+
+    /** Like HealthConnectManager's page: selected by start, watermark = newest end, open starts reported. */
+    private fun spanPage(typeId: String, all: List<Span>, query: ProviderPageQuery, pageToken: String?): ProviderReadResult {
+        val inRange = all.filter { it.startMs >= query.startMs && it.startMs < query.endMs }
+            .let { if (query.ascending) it.sortedBy { s -> s.startMs } else it.sortedByDescending { s -> s.startMs } }
+        val offset = pageToken?.toInt() ?: 0
+        val page = inRange.drop(offset).take(query.pageSize)
+        val next = (offset + page.size).takeIf { it < inRange.size }?.toString()
+        page.forEach { served.add(it.id) }
+        return ProviderReadResult(UnifiedHealthData(records = page.map { spanRecord(typeId, it) }), page.maxOfOrNull { it.endMs },
+            if (query.ascending) null else page.lastOrNull()?.endMs, page.size, next, true, page.minOfOrNull { it.startMs },
+            SyncPolicy.openStartMs(page.map { it.startMs to it.endMs }, query.endMs))
+    }
+
+    private fun spanRecord(type: String, span: Span) = UnifiedRecord(span.id, type.uppercase(),
+        UnifiedTimestamp.fromEpochMs(span.startMs), UnifiedTimestamp.fromEpochMs(span.endMs), null,
+        UnifiedSource("synthetic.app", null, null, null, null, null, null), span.value, "count", null, null)
 
     private fun record(type: String, index: Int, ts: Long): UnifiedRecord {
         val iso = UnifiedTimestamp.fromEpochMs(ts)
@@ -250,4 +293,10 @@ internal class SyncHarness(
     fun markInitialExportDone() = prefs.edit().putBoolean("fullDone.user.${owner.userId}", true).commit()
 
     fun anchors(): String = prefs.getString(StorageKeys.KEY_ANCHORS, null) ?: "{}"
+
+    /** Anchors as SyncManager stores them (epoch ms as JSON numbers). */
+    fun storeAnchors(vararg anchors: Pair<String, Long>) = prefs.edit().putString(StorageKeys.KEY_ANCHORS,
+        Json.encodeToString(anchors.toMap().mapValues { it.value.toDouble() })).commit()
+
+    fun anchorOf(type: String): Long? = Json.decodeFromString<Map<String, Double>>(anchors())[type]?.toLong()
 }

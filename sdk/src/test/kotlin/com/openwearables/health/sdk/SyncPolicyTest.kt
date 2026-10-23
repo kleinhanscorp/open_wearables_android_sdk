@@ -103,6 +103,30 @@ class SyncPolicyTest {
         assertNull(SyncPolicy.rolloverBounds(0, 301, false, null, 300), "oldest did not move: stalled")
     }
 
+    @Test fun anOpenRecordHoldsTheAnchorAtItsStart() {
+        // GUT-217: spans are (start, end); the query ends at 1 000.
+        assertEquals(500L, SyncPolicy.openStartMs(listOf(100L to 200L, 700L to 1_500L, 500L to 2_000L), 1_000L))
+        assertNull(SyncPolicy.openStartMs(listOf(100L to 200L, 300L to 1_000L), 1_000L), "ending at the query's end is closed")
+        val end = 10 * SyncPolicy.OPEN_RECORD_HOLD_MAX_MS
+        assertNull(SyncPolicy.openStartMs(listOf(end - SyncPolicy.OPEN_RECORD_HOLD_MAX_MS - 1 to Long.MAX_VALUE), end),
+            "a record open for days (a far-future end) never holds the anchor")
+        assertEquals(500L, SyncPolicy.committableAnchor(2_000L, 1_000L, 500L))
+        assertEquals(1_000L, SyncPolicy.committableAnchor(2_000L, 1_000L, null), "never past the query's end")
+        assertEquals(800L, SyncPolicy.committableAnchor(800L, 1_000L, null))
+        assertNull(SyncPolicy.committableAnchor(null, 1_000L, null), "nothing read: nothing to commit")
+    }
+
+    @Test fun aFutureAnchorHealsToTheStartOfTheLocalDay() {
+        // The S23 on 23 Oct: 21:40 SAST, steps anchor at the next local midnight.
+        val zone = java.time.ZoneId.of("Africa/Johannesburg")
+        fun at(day: Int, hour: Int, minute: Int = 0) =
+            java.time.ZonedDateTime.of(2026, 10, day, hour, minute, 0, 0, zone).toInstant().toEpochMilli()
+        val now = at(23, 21, 40)
+        assertEquals(at(23, 0), SyncPolicy.healedAnchor(at(24, 0), now, zone))
+        assertEquals(now - 1, SyncPolicy.healedAnchor(now - 1, now, zone), "a past anchor is kept")
+        assertEquals(now, SyncPolicy.healedAnchor(now, now, zone))
+    }
+
     @Test fun backoffWindowSurvivesRestartAndIsOwnerScoped() {
         val prefs = FakePrefs()
         val now = 1_790_000_000_000L

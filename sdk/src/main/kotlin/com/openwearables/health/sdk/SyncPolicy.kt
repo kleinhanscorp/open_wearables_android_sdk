@@ -160,4 +160,36 @@ internal object SyncPolicy {
     fun rolloverBounds(startMs: Long, endMs: Long, ascending: Boolean, watermarkMs: Long?, oldestStartMs: Long?): Pair<Long, Long>? =
         if (ascending) watermarkMs?.takeIf { it > startMs && it < endMs }?.let { it to endMs }
         else oldestStartMs?.let { it + 1 }?.takeIf { it > startMs && it < endMs }?.let { startMs to it }
+
+    /** A record open longer than this before the query's end is not waited for (a 25-hour DST day fits). */
+    const val OPEN_RECORD_HOLD_MAX_MS = 36 * 3_600_000L
+
+    /**
+     * Gutsy fork (GUT-217): the earliest start among records still open at the query's end, given
+     * as (start, end) spans. Samsung Health writes a day's steps total from local midnight to the
+     * NEXT midnight and keeps it growing; `null` when every record has closed. A record begun more
+     * than [OPEN_RECORD_HOLD_MAX_MS] earlier (a far-future end) never holds a type's reads open.
+     */
+    fun openStartMs(spans: List<Pair<Long, Long>>, queryEndMs: Long): Long? =
+        spans.filter { it.second > queryEndMs && queryEndMs - it.first <= OPEN_RECORD_HOLD_MAX_MS }.minOfOrNull { it.first }
+
+    /**
+     * Gutsy fork (GUT-217): the anchor a type may commit. Health Connect selects a read by record
+     * START, inclusive, while the watermark is the newest record END; a record still open would put
+     * the anchor in the future, where every later window is empty and `TimeRangeFilter.between`
+     * throws before anything is sent. The anchor never passes the query's end, nor the start of a
+     * record still open there, so that record is read again until it closes; OW upserts the re-sent
+     * row (data source, series type, start) and keeps the newer value.
+     */
+    fun committableAnchor(watermarkMs: Long?, queryEndMs: Long, openStartMs: Long?): Long? =
+        watermarkMs?.let { minOf(it, queryEndMs, openStartMs ?: it) }
+
+    /**
+     * Gutsy fork (GUT-217): a stored anchor beyond now came from a fork before [committableAnchor],
+     * from a record that was still open. Its start is unknown; the known producer is a local-day
+     * total, so the anchor heals to the start of the local day and that day is read once more.
+     */
+    fun healedAnchor(anchorMs: Long, nowMs: Long, zone: java.time.ZoneId): Long =
+        if (anchorMs <= nowMs) anchorMs
+        else java.time.Instant.ofEpochMilli(nowMs).atZone(zone).toLocalDate().atStartOfDay(zone).toInstant().toEpochMilli()
 }

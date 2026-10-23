@@ -40,7 +40,9 @@ data class TypeSyncProgress(
     // Gutsy fork (OW-P3) — page-session rollover bound and consecutive transient read failures.
     var pendingOldestStartMs: Long? = null,
     var pageRollovers: Int = 0,
-    var readFailures: Int = 0
+    var readFailures: Int = 0,
+    // Gutsy fork (GUT-217) — earliest start of an accepted record still open at the query's end.
+    var pendingOpenStartMs: Long? = null
 )
 
 @Serializable
@@ -390,9 +392,10 @@ class SyncManager(
             val mode = if (effectiveFullExport) "full export" else "incremental"
             logger("Sync: starting ($mode, ${types.size} types, ${healthProvider.providerName}, $floorLabel)")
             stateMutex.withLock {
+                // The session's end comes from the clock that heals anchors (GUT-217).
                 inMemoryState = SyncState(
                     userKey = userKey(), fullExport = effectiveFullExport,
-                    createdAt = System.currentTimeMillis(), connectionGeneration = owner.generation, queryFloorMs = floor
+                    createdAt = clock(), connectionGeneration = owner.generation, queryFloorMs = floor
                 )
                 persistStateToDisk()
             }
@@ -528,7 +531,8 @@ class SyncManager(
         val isDone: Boolean = false,
         val nativePage: Boolean = false,
         val nextPageToken: String? = null,
-        val minStartMs: Long? = null
+        val minStartMs: Long? = null,
+        val openStartMs: Long? = null
     )
 
     private fun roundStatuses(types: List<String>, completed: Set<String>, skipped: Map<String, String>): Map<String, String> =
@@ -562,11 +566,10 @@ class SyncManager(
         }
 
         if (!fullExport) {
-            val anchors = loadAnchors()
             val floor = syncStartTimestamp()
             for (type in types) {
                 if (!completedTypes.contains(type) && !anchorCursors.containsKey(type)) {
-                    val storedAnchor = anchors[type]
+                    val storedAnchor = anchorFor(type)
                     val anchor = when {
                         storedAnchor != null && floor != null -> maxOf(storedAnchor, floor)
                         storedAnchor != null -> storedAnchor
@@ -662,7 +665,8 @@ class SyncManager(
                 synchronized(SecureStorage.connectionLock) {
                 requireSyncOwner()
                 for (result in roundResults) {
-                    updateInMemoryProgress(result.type, result.count, isComplete = result.isDone, anchorTimestamp = result.anchorTimestamp)
+                    updateInMemoryProgress(result.type, result.count, isComplete = result.isDone, anchorTimestamp = result.anchorTimestamp,
+                        openStartMs = result.openStartMs)
                     inMemoryState?.typeProgress?.get(result.type)?.readFailures = 0
                     if (result.nativePage) {
                         inMemoryState?.typeProgress?.get(result.type)?.let { progress ->
@@ -756,7 +760,9 @@ class SyncManager(
             val progress = state.typeProgress.getOrPut(type) { TypeSyncProgress(type) }
             if (progress.queryStartMs == null) {
                 val floor = state.queryFloorMs ?: 0L
-                progress.queryStartMs = if (fullExport) floor else maxOf(loadAnchors()[type] ?: floor, floor)
+                // Gutsy fork (GUT-217): a window never starts past the session's end.
+                val start = if (fullExport) floor else maxOf(anchorFor(type) ?: floor, floor)
+                progress.queryStartMs = minOf(start, state.createdAt)
                 progress.queryEndMs = state.createdAt
                 progress.nativePageSize = minOf(limit, 200)
                 // Persist the query before a first page: resume must not move its time bounds.
@@ -766,6 +772,12 @@ class SyncManager(
             if (progress.nativePageCount >= nativePageBudget) rollOverPageSession(type, progress, fullExport)
             Pair(ProviderPageQuery(progress.queryStartMs!!, progress.queryEndMs!!,
                 progress.nativePageSize!!, !fullExport), progress.nativePageToken)
+        }
+        // Gutsy fork (GUT-217): Health Connect refuses a window whose start is not before its end
+        // (TimeRangeFilter.between). Nothing between the anchor and the session's end is complete.
+        if (query.startMs >= query.endMs) {
+            logger("  $type: no new data")
+            return FetchResult(type = type, isDone = true)
         }
         requireSyncOwner()
         val result = healthProvider.readPage(type, query, token)
@@ -786,7 +798,8 @@ class SyncManager(
         val watermark = listOfNotNull(previousMax, result.maxTimestamp).maxOrNull()
         return FetchResult(type, result.data, result.nativeRecordCount,
             anchorTimestamp = watermark, isDone = result.nextPageToken == null,
-            nativePage = true, nextPageToken = result.nextPageToken, minStartMs = result.minStartTimestamp)
+            nativePage = true, nextPageToken = result.nextPageToken, minStartMs = result.minStartTimestamp,
+            openStartMs = result.openStartTimestamp)
     }
 
     /**
@@ -796,9 +809,10 @@ class SyncManager(
      * upper bound to the oldest accepted start. A session that cannot move parks the type.
      */
     private fun rollOverPageSession(type: String, progress: TypeSyncProgress, fullExport: Boolean) {
+        val anchor = SyncPolicy.committableAnchor(progress.pendingAnchorTimestamp, progress.queryEndMs!!, progress.pendingOpenStartMs)
         val bounds = SyncPolicy.rolloverBounds(progress.queryStartMs!!, progress.queryEndMs!!, !fullExport,
-            progress.pendingAnchorTimestamp, progress.pendingOldestStartMs) ?: throw TypeSkip(TypeStatus.PAGE_BUDGET_STALLED)
-        if (!fullExport) progress.pendingAnchorTimestamp?.let { saveAnchor(type, it) }
+            anchor, progress.pendingOldestStartMs) ?: throw TypeSkip(TypeStatus.PAGE_BUDGET_STALLED)
+        if (!fullExport) anchor?.let { saveAnchor(type, it) }
         progress.queryStartMs = bounds.first
         progress.queryEndMs = bounds.second
         progress.nativePageToken = null
@@ -862,6 +876,13 @@ class SyncManager(
         anchor: Long?,
         limit: Int
     ): FetchResult {
+        // Gutsy fork (GUT-217): a cursor at or past the session's end (a still-open record's end)
+        // has nothing to read, and Samsung Health's since-to-now window would be inverted.
+        val end = inMemoryState?.createdAt ?: error("Incremental read has no owned session")
+        if (anchor != null && anchor >= end) {
+            logger("  $type: no new data")
+            return FetchResult(type = type, isDone = true)
+        }
         logger("  $type: querying (limit=$limit)...")
 
         val result = healthProvider.readData(type, anchor, limit)
@@ -883,16 +904,20 @@ class SyncManager(
         )
     }
 
-    private fun updateInMemoryProgress(typeIdentifier: String, sentInChunk: Int, isComplete: Boolean, anchorTimestamp: Long?) {
+    private fun updateInMemoryProgress(typeIdentifier: String, sentInChunk: Int, isComplete: Boolean, anchorTimestamp: Long?,
+                                       openStartMs: Long? = null) {
         val state = inMemoryState ?: return
         val progress = state.typeProgress.getOrPut(typeIdentifier) { TypeSyncProgress(typeIdentifier) }
         progress.sentCount += sentInChunk
         progress.isComplete = isComplete
         if (anchorTimestamp != null) progress.pendingAnchorTimestamp = anchorTimestamp
+        progress.pendingOpenStartMs = listOfNotNull(progress.pendingOpenStartMs, openStartMs).minOrNull()
         state.totalSentCount += sentInChunk
         if (isComplete) {
             state.completedTypes.add(typeIdentifier)
-            progress.pendingAnchorTimestamp?.let { saveAnchor(typeIdentifier, it) }
+            // Gutsy fork (GUT-217): never past the session's end nor a still-open record's start.
+            SyncPolicy.committableAnchor(progress.pendingAnchorTimestamp, progress.queryEndMs ?: state.createdAt,
+                progress.pendingOpenStartMs)?.let { saveAnchor(typeIdentifier, it) }
         }
     }
 
@@ -1202,6 +1227,8 @@ class SyncManager(
         val counts = mutableMapOf<String, Int>()
         val end = inMemoryState?.createdAt ?: error("Count has no owned query")
         for (type in types) {
+            // Gutsy fork (GUT-217): an empty window counts nothing; Health Connect refuses to read it.
+            if ((sinceTimestamp ?: 0L) >= end) { counts[type] = 0; continue }
             try {
                 var count = 0
                 var token: String? = null
@@ -1323,6 +1350,16 @@ class SyncManager(
             val map = json.decodeFromString<Map<String, Double>>(jsonStr)
             map.mapValues { it.value.toLong() }
         } catch (_: Exception) { emptyMap() }
+    }
+
+    /** Gutsy fork (GUT-217): the type's stored anchor, healed when it lies in the future ([SyncPolicy.healedAnchor]). */
+    private fun anchorFor(type: String): Long? {
+        val stored = loadAnchors()[type] ?: return null
+        val healed = SyncPolicy.healedAnchor(stored, clock(), java.time.ZoneId.systemDefault())
+        if (healed != stored) {
+            logger("  $type: anchor ${java.time.Instant.ofEpochMilli(stored)} is in the future; reading from ${java.time.Instant.ofEpochMilli(healed)}")
+        }
+        return healed
     }
 
     private fun saveAnchor(type: String, timestamp: Long) = synchronized(SecureStorage.connectionLock) {

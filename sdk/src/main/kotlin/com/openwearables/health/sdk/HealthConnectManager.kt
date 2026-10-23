@@ -313,7 +313,8 @@ class HealthConnectManager(
         } else null
         val minStart = response.records.mapNotNull { getRecordStartTimestamp(it) }.minOrNull()
 
-        return ProviderReadResult(result.data, result.maxTimestamp, minTs, response.records.size, response.pageToken?.takeIf { it.isNotEmpty() }, true, minStart)
+        return ProviderReadResult(result.data, result.maxTimestamp, minTs, response.records.size, response.pageToken?.takeIf { it.isNotEmpty() }, true, minStart,
+            openStart(response.records, query))
     }
 
     private fun getRecordTimestamp(record: Record): Long? = when (record) {
@@ -351,6 +352,15 @@ class HealthConnectManager(
         is ExerciseSessionRecord -> record.startTime.toEpochMilli()
         is SleepSessionRecord -> record.startTime.toEpochMilli()
         else -> getRecordTimestamp(record) // instantaneous records: start == time
+    }
+
+    /** Gutsy fork (GUT-217): a record still open at a page query's end keeps the anchor at its start. */
+    private fun openStart(records: List<Record>, query: ProviderPageQuery?): Long? = query?.let { q ->
+        SyncPolicy.openStartMs(records.mapNotNull { r ->
+            val start = getRecordStartTimestamp(r) ?: return@mapNotNull null
+            val end = getRecordTimestamp(r) ?: return@mapNotNull null
+            start to end
+        }, q.endMs)
     }
 
     // -----------------------------------------------------------------------
@@ -744,7 +754,7 @@ class HealthConnectManager(
         } else null
 
         return ProviderReadResult(UnifiedHealthData(workouts = workouts), maxTs, minTs, response.records.size, response.pageToken?.takeIf { it.isNotEmpty() }, true,
-            response.records.minOf { it.startTime.toEpochMilli() })
+            response.records.minOf { it.startTime.toEpochMilli() }, openStart(response.records, query))
     }
 
     private fun mapSegmentType(type: Int): String = when (type) {
@@ -907,7 +917,7 @@ class HealthConnectManager(
         } else null
 
         return ProviderReadResult(UnifiedHealthData(sleep = sleepEntries), maxTs, minTs, response.records.size, response.pageToken?.takeIf { it.isNotEmpty() }, true,
-            response.records.minOf { it.startTime.toEpochMilli() })
+            response.records.minOf { it.startTime.toEpochMilli() }, openStart(response.records, query))
     }
 
     private fun mapSleepStage(stage: Int): String = when (stage) {
