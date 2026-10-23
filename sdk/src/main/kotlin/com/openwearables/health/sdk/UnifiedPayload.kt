@@ -170,7 +170,9 @@ data class ProviderReadResult(
     val minTimestamp: Long? = null,
     val nativeRecordCount: Int? = null,
     val nextPageToken: String? = null,
-    val nativePage: Boolean = false
+    val nativePage: Boolean = false,
+    /** Gutsy fork (OW-P3): earliest record start in the page; bounds a historical page-session rollover. */
+    val minStartTimestamp: Long? = null
 )
 
 /** Immutable query retained across every native page, including resume and timestamp ties. */

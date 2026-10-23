@@ -41,6 +41,13 @@ interface HealthDataProvider {
     fun getTrackedTypes(): Set<String>
 
     /**
+     * Gutsy fork (OW-P3): which of [typeIds] this run may read, re-checked every run. The default
+     * reads all of them (Samsung Health keeps its own path); Health Connect intersects its readers
+     * with the grants held right now and reads alias ids once.
+     */
+    suspend fun resolveReadableTypes(typeIds: Collection<String>): TypeReadability = TypeReadability.all(typeIds)
+
+    /**
      * Show the provider's native permission UI for the given [typeIds].
      * Returns `true` if all requested permissions were granted.
      */

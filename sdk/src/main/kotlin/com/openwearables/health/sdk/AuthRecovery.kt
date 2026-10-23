@@ -45,6 +45,12 @@ internal class AuthRecovery(
 ) {
     enum class Result { SUCCESS, AUTH_FAILURE, NETWORK_ERROR }
 
+    /** Gutsy fork (OW-P3): why a lease check did not pass, so the sync can back off (429, outage) or stop (refused). */
+    data class LeaseVerdict(val kind: Kind, val retryAfterSec: Long? = null) {
+        enum class Kind { ACTIVE, INACTIVE, REJECTED, UNCONFIGURED, RATE_LIMITED, TRANSIENT, BACKED_OFF, SUPERSEDED }
+        val active: Boolean get() = kind == Kind.ACTIVE
+    }
+
     private enum class RenewalOutcome { RENEWED, REJECTED, TRANSIENT, UNAVAILABLE }
 
     companion object {
@@ -64,7 +70,7 @@ internal class AuthRecovery(
         private val validationMutex = Mutex()
         private var validationOwner: SecureStorage.ConnectionOwner? = null
         private var validationCompletedAt = 0L
-        private var validationResult = false
+        private var validationVerdict = LeaseVerdict(LeaseVerdict.Kind.TRANSIENT)
         private var validationBackoffUntil = 0L
 
         private val JSON_MEDIA = "application/json".toMediaType()
@@ -108,15 +114,20 @@ internal class AuthRecovery(
     }
 
     /** Verify this device lease before new upload work. Does not rotate/mint tokens. */
-    suspend fun validateDeviceLease(owner: SecureStorage.ConnectionOwner): Boolean {
+    suspend fun validateDeviceLease(owner: SecureStorage.ConnectionOwner): Boolean = validateDeviceLeaseVerdict(owner).active
+
+    /** Gutsy fork (OW-P3): [validateDeviceLease] with the reason, including the server's Retry-After. */
+    suspend fun validateDeviceLeaseVerdict(owner: SecureStorage.ConnectionOwner): LeaseVerdict {
         val initiatedAt = System.currentTimeMillis()
         return validationMutex.withLock {
-            if (!storage.isCurrent(owner)) return@withLock false
+            if (!storage.isCurrent(owner)) return@withLock LeaseVerdict(LeaseVerdict.Kind.SUPERSEDED)
             // A waiter shares the result completed after it entered, never a later owner's result.
-            if (validationOwner == owner && validationCompletedAt >= initiatedAt) return@withLock validationResult
-            if (validationOwner == owner && initiatedAt < validationBackoffUntil) return@withLock false
+            if (validationOwner == owner && validationCompletedAt >= initiatedAt) return@withLock validationVerdict
+            if (validationOwner == owner && initiatedAt < validationBackoffUntil) {
+                return@withLock LeaseVerdict(LeaseVerdict.Kind.BACKED_OFF, (validationBackoffUntil - initiatedAt + 999L) / 1000L)
+            }
             validationOwner = owner
-            val result = withContext(ioDispatcher) {
+            val verdict = withContext(ioDispatcher) {
                 val request = storage.withConnection(owner) {
                     val url = storage.getRenewalUrl() ?: return@withConnection null
                     val token = storage.getRenewalToken() ?: return@withConnection null
@@ -124,37 +135,45 @@ internal class AuthRecovery(
                     val body = JSONObject().put("renewal_token", token).put("validate_only", true)
                         .toString().toRequestBody(JSON_MEDIA)
                     Pair(Request.Builder().url(url).post(body).header("Content-Type", "application/json").build(), generation)
-                } ?: return@withContext false
+                } ?: return@withContext LeaseVerdict(
+                    if (storage.isCurrent(owner)) LeaseVerdict.Kind.UNCONFIGURED else LeaseVerdict.Kind.SUPERSEDED)
                 try {
-                    if (!storage.isCurrent(owner)) return@withContext false
+                    if (!storage.isCurrent(owner)) return@withContext LeaseVerdict(LeaseVerdict.Kind.SUPERSEDED)
                     httpClient.newCall(request.first).execute().use { response ->
                         val text = response.body?.string()
                         storage.withConnection(owner) {
                             if (response.code == 401 || response.code == 403 || response.code == 410) {
                                 storage.setDeviceLeaseRejected(true)
-                                markReauthRequired(); storage.invalidateConnection(); false
+                                markReauthRequired(); storage.invalidateConnection()
+                                LeaseVerdict(LeaseVerdict.Kind.REJECTED)
                             } else if (response.isSuccessful && text != null) {
                                 val json = JSONObject(text)
-                                json.optBoolean("lease_active", false) &&
+                                val active = json.optBoolean("lease_active", false) &&
                                     json.optString("connection_generation") == request.second &&
                                     json.optString("device_id") == storage.deviceId()
+                                LeaseVerdict(if (active) LeaseVerdict.Kind.ACTIVE else LeaseVerdict.Kind.INACTIVE)
                             } else {
-                                val seconds = if (response.code == 429) response.header("Retry-After")?.toLongOrNull() ?: 900L else 60L
-                                validationBackoffUntil = System.currentTimeMillis() + seconds.coerceIn(60L, 3600L) * 1000L
-                                false
+                                val limited = response.code == 429
+                                val seconds = (if (limited) SyncPolicy.parseRetryAfterSeconds(response.header("Retry-After"),
+                                    System.currentTimeMillis()) ?: 900L else 60L).coerceIn(60L, 3600L)
+                                validationBackoffUntil = System.currentTimeMillis() + seconds * 1000L
+                                LeaseVerdict(if (limited) LeaseVerdict.Kind.RATE_LIMITED else LeaseVerdict.Kind.TRANSIENT, seconds)
                             }
-                        } ?: false
+                        } ?: LeaseVerdict(LeaseVerdict.Kind.SUPERSEDED)
                     }
                 } catch (e: Exception) {
                     validationBackoffUntil = System.currentTimeMillis() + 60_000L
                     logger("Device lease validation unavailable; sync remains pending")
-                    false
+                    LeaseVerdict(LeaseVerdict.Kind.TRANSIENT, 60L)
                 }
             }
-            validationResult = result
+            validationVerdict = verdict
             validationCompletedAt = System.currentTimeMillis()
-            if (!result && validationBackoffUntil < validationCompletedAt) validationBackoffUntil = validationCompletedAt + 60_000L
-            result
+            // An active lease ends any earlier window: the gate is process-wide, so a 429 seen by a
+            // superseded connection must not block the next check of one that just passed.
+            if (verdict.active) validationBackoffUntil = 0L
+            else if (validationBackoffUntil < validationCompletedAt) validationBackoffUntil = validationCompletedAt + 60_000L
+            verdict
         }
     }
 

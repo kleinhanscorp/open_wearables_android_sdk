@@ -17,11 +17,14 @@ class HealthSyncWorker(
     companion object {
         const val KEY_HOST = "host"
         const val KEY_CUSTOM_SYNC_URL = "customSyncUrl"
+        const val KEY_TRIGGER = "trigger"
     }
 
     override suspend fun doWork(): Result {
         val host = inputData.getString(KEY_HOST) ?: return Result.failure()
         val customSyncUrl = inputData.getString(KEY_CUSTOM_SYNC_URL)
+        // Requests enqueued before OW-P3 carry no trigger; only the periodic one outlives an update.
+        val trigger = inputData.getString(KEY_TRIGGER) ?: SyncTrigger.PERIODIC
 
         try {
             setForeground(getForegroundInfo())
@@ -41,9 +44,13 @@ class HealthSyncWorker(
             val trackedTypes = secureStorage.getTrackedTypes()
             provider.setTrackedTypes(trackedTypes)
 
-            android.util.Log.d("HealthSyncWorker", "Background sync (provider: ${provider.providerId})")
-            syncManager.syncNow(host, customSyncUrl, fullExport = false)
+            android.util.Log.d("HealthSyncWorker", "Background sync (provider: ${provider.providerId}, trigger: $trigger)")
+            val outcome = syncManager.syncNow(host, customSyncUrl, fullExport = false, trigger = trigger)
+            android.util.Log.d("HealthSyncWorker", "Background sync outcome: $outcome")
 
+            // Gutsy fork (OW-P3): a transient failure has already scheduled ONE WorkManager retry at its
+            // persisted, jittered backoff, never before Retry-After. Returning retry() as well would
+            // stack WorkManager's own un-jittered backoff on top, so every handled outcome succeeds here.
             Result.success()
         } catch (e: Exception) {
             android.util.Log.e("HealthSyncWorker", "Sync failed", e)

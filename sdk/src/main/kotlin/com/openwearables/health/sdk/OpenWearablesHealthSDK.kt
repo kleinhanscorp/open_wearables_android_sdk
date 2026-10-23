@@ -213,6 +213,7 @@ class OpenWearablesHealthSDK private constructor(
         secureStorage.invalidateConnection()
         val sm = ensureSyncManager()
         sm.clearSyncSession()
+        sm.clearRetryState()
 
         // A fresh sign-in supersedes any renewal credential and any prior verdict.
         secureStorage.clearRenewalCredential()
@@ -245,7 +246,7 @@ class OpenWearablesHealthSDK private constructor(
         } finally {
             val sm = syncManager
             try { sm?.stopBackgroundSync() } catch (_: Exception) { logMessage("Periodic cancellation unconfirmed") }
-            try { sm?.resetAnchors(); sm?.clearSyncSession() } catch (_: Exception) { logMessage("Local sync cleanup unconfirmed") }
+            try { sm?.resetAnchors(); sm?.clearSyncSession(); sm?.clearRetryState() } catch (_: Exception) { logMessage("Local sync cleanup unconfirmed") }
             try { activeProvider?.disconnect() } catch (_: Exception) { logMessage("Local provider cleanup unconfirmed") }
             activeProvider = null; syncManager = null
         }
@@ -412,8 +413,8 @@ class OpenWearablesHealthSDK private constructor(
             logMessage("Triggering full export after reset...")
             scope.launch {
                 try {
-                    sm.syncNow(h, customSyncUrl, fullExport = true)
-                    logMessage("Full export after reset completed")
+                    val outcome = sm.syncNow(h, customSyncUrl, fullExport = true, trigger = SyncTrigger.RESET)
+                    logMessage("Full export after reset ended: $outcome")
                 } catch (e: Exception) {
                     logMessage("Full export after reset failed: ${e.message}")
                 }
@@ -427,7 +428,7 @@ class OpenWearablesHealthSDK private constructor(
         val h = host ?: throw IllegalStateException("Host not configured")
         val sm = ensureSyncManager()
         if (!sm.hasResumableSyncSession()) throw IllegalStateException("No resumable sync session")
-        sm.syncNow(h, customSyncUrl, fullExport = false)
+        sm.syncNow(h, customSyncUrl, fullExport = false, trigger = SyncTrigger.RESUME)
     }
 
     fun clearSyncSession() {
@@ -435,6 +436,12 @@ class OpenWearablesHealthSDK private constructor(
     }
 
     fun hasResumableSyncSession(): Boolean = ensureSyncManager().hasResumableSyncSession()
+
+    /**
+     * Gutsy fork (OW-P3, GUT-217 #16 hook): this member's recent sync attempts — stage, times,
+     * counts, error code, per-type status. Not bridged to JS until OW-P2-DESIGN fixes the shape.
+     */
+    fun getSyncAttempts(): List<Map<String, Any?>> = ensureSyncManager().getSyncAttempts()
 
     // -----------------------------------------------------------------------
     // Provider management
@@ -488,7 +495,7 @@ class OpenWearablesHealthSDK private constructor(
                 val sm = ensureSyncManager()
                 if (sm.hasResumableSyncSession()) {
                     logMessage("Found interrupted sync, resuming...")
-                    host?.let { sm.syncNow(it, customSyncUrl, fullExport = false) }
+                    host?.let { sm.syncNow(it, customSyncUrl, fullExport = false, trigger = SyncTrigger.FOREGROUND) }
                 }
             }
         }

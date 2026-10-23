@@ -47,13 +47,13 @@ class AuthRecoveryOwnershipTest {
         every { storage.getAuthState() } returns "ok"
         every { storage.getRenewalFailures() } returns 0
         every { storage.getLastRenewalAttemptAt() } returns 0L
-        val delayedCall = mockk<Call>()
+        val delayedCall = mockk<okhttp3.Call>()
         every { delayedCall.execute() } answers {
             entered.countDown(); check(release.await(5, TimeUnit.SECONDS))
             response(delayedStatus, "{\"access_token\":\"late-A\",\"refresh_token\":\"late-refresh-A\"}")
         }
         if (renewal) {
-            val rejectedCall = mockk<Call>()
+            val rejectedCall = mockk<okhttp3.Call>()
             every { rejectedCall.execute() } answers { response(401, "{}") }
             every { client.newCall(any()) } returnsMany listOf(rejectedCall, delayedCall)
         } else every { client.newCall(any()) } returns delayedCall

@@ -24,6 +24,12 @@ android {
         jvmTarget = "17"
     }
 
+    // Gutsy fork (OW-P3): the sync-run JVM tests reach android.util.JsonWriter / Log through the real
+    // SyncManager; stubs return defaults there instead of throwing. Unit tests only.
+    testOptions {
+        unitTests.isReturnDefaultValues = true
+    }
+
     publishing {
         singleVariant("release") {
             withSourcesJar()

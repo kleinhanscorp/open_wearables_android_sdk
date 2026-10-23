@@ -86,6 +86,29 @@ class HealthConnectManager(
 
     override fun getTrackedTypes(): Set<String> = trackedTypeIds
 
+    /**
+     * Gutsy fork (OW-P3, GUT-217 #6): every run reads only ids with a Health Connect reader whose
+     * read permission is granted NOW. A type revoked since Connect is skipped with a status instead
+     * of failing the combined round; distance / blood-pressure / water aliases are read once.
+     */
+    override suspend fun resolveReadableTypes(typeIds: Collection<String>): TypeReadability {
+        if (!isAvailable()) return TypeReadability.unavailable(typeIds)
+        if (client == null) withContext(dispatchers.main) { connect() }
+        val hcClient = client ?: return TypeReadability.unavailable(typeIds)
+        val granted = try {
+            withContext(dispatchers.io) { hcClient.permissionController.getGrantedPermissions() }
+        } catch (e: Exception) {
+            logger("Health Connect grants unavailable: ${e.javaClass.simpleName}")
+            return TypeReadability(emptyList(), typeIds.distinct().associateWith { TypeStatus.READ_FAILED }, transientFailure = true)
+        }
+        return SyncPolicy.resolveReadable(
+            typeIds.toList(),
+            { id -> mapToRecordClass(id)?.java?.name },
+            { id -> mapToRecordClass(id)?.let { HealthPermission.getReadPermission(it) } },
+            granted
+        ).copy(backgroundReadGranted = HealthPermission.PERMISSION_READ_HEALTH_DATA_IN_BACKGROUND in granted)
+    }
+
     override fun isAvailable(): Boolean {
         return try {
             HealthConnectClient.getSdkStatus(context) == HealthConnectClient.SDK_AVAILABLE
@@ -288,8 +311,9 @@ class HealthConnectManager(
         val minTs = if (!ascending && response.records.isNotEmpty()) {
             getRecordTimestamp(response.records.last())
         } else null
+        val minStart = response.records.mapNotNull { getRecordStartTimestamp(it) }.minOrNull()
 
-        return ProviderReadResult(result.data, result.maxTimestamp, minTs, response.records.size, response.pageToken?.takeIf { it.isNotEmpty() }, true)
+        return ProviderReadResult(result.data, result.maxTimestamp, minTs, response.records.size, response.pageToken?.takeIf { it.isNotEmpty() }, true, minStart)
     }
 
     private fun getRecordTimestamp(record: Record): Long? = when (record) {
@@ -315,6 +339,18 @@ class HealthConnectManager(
         is ExerciseSessionRecord -> record.endTime.toEpochMilli()
         is SleepSessionRecord -> record.endTime.toEpochMilli()
         else -> null
+    }
+
+    private fun getRecordStartTimestamp(record: Record): Long? = when (record) {
+        is StepsRecord -> record.startTime.toEpochMilli()
+        is HeartRateRecord -> record.startTime.toEpochMilli()
+        is ActiveCaloriesBurnedRecord -> record.startTime.toEpochMilli()
+        is FloorsClimbedRecord -> record.startTime.toEpochMilli()
+        is DistanceRecord -> record.startTime.toEpochMilli()
+        is HydrationRecord -> record.startTime.toEpochMilli()
+        is ExerciseSessionRecord -> record.startTime.toEpochMilli()
+        is SleepSessionRecord -> record.startTime.toEpochMilli()
+        else -> getRecordTimestamp(record) // instantaneous records: start == time
     }
 
     // -----------------------------------------------------------------------
@@ -707,7 +743,8 @@ class HealthConnectManager(
             response.records.last().endTime.toEpochMilli()
         } else null
 
-        return ProviderReadResult(UnifiedHealthData(workouts = workouts), maxTs, minTs, response.records.size, response.pageToken?.takeIf { it.isNotEmpty() }, true)
+        return ProviderReadResult(UnifiedHealthData(workouts = workouts), maxTs, minTs, response.records.size, response.pageToken?.takeIf { it.isNotEmpty() }, true,
+            response.records.minOf { it.startTime.toEpochMilli() })
     }
 
     private fun mapSegmentType(type: Int): String = when (type) {
@@ -869,7 +906,8 @@ class HealthConnectManager(
             response.records.last().endTime.toEpochMilli()
         } else null
 
-        return ProviderReadResult(UnifiedHealthData(sleep = sleepEntries), maxTs, minTs, response.records.size, response.pageToken?.takeIf { it.isNotEmpty() }, true)
+        return ProviderReadResult(UnifiedHealthData(sleep = sleepEntries), maxTs, minTs, response.records.size, response.pageToken?.takeIf { it.isNotEmpty() }, true,
+            response.records.minOf { it.startTime.toEpochMilli() })
     }
 
     private fun mapSleepStage(stage: Int): String = when (stage) {
