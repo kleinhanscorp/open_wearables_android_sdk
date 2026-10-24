@@ -247,10 +247,15 @@ class SyncManager(
             ))
             .build()
 
+        // Gutsy fork (GUT-217) — KEEP, never REPLACE. REPLACE cancelled the run already uploading when
+        // a second trigger landed (an activity pause, the JS catch-up, configure()), and its replacement
+        // met that run's SyncRunGate and came back BUSY, so nothing was sent (S23, 24 Oct). A trigger
+        // while a run is pending or running is dropped: that run reads to its session's end and the
+        // periodic run takes anything newer. Once it has finished, the next trigger enqueues a fresh run.
         WorkManager.getInstance(context).enqueueUniqueWork(
-            SyncDefaults.WORK_NAME_EXPEDITED, ExistingWorkPolicy.REPLACE, expeditedWork
+            SyncDefaults.WORK_NAME_EXPEDITED, ExistingWorkPolicy.KEEP, expeditedWork
         )
-        logger("Scheduled expedited sync")
+        logger("Expedited sync requested (kept if one is already pending)")
     }
 
     fun stopBackgroundSync() {

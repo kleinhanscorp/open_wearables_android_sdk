@@ -3,6 +3,12 @@ package com.openwearables.health.sdk
 import android.app.Activity
 import android.content.Context
 import android.content.SharedPreferences
+import androidx.work.ExistingPeriodicWorkPolicy
+import androidx.work.ExistingWorkPolicy
+import androidx.work.OneTimeWorkRequest
+import androidx.work.Operation
+import androidx.work.WorkManager
+import androidx.work.WorkRequest
 import io.mockk.every
 import io.mockk.mockk
 import kotlinx.coroutines.CompletableDeferred
@@ -71,6 +77,63 @@ internal class RecordingScheduler : RetryScheduler {
         scheduled.add(delayMs to replaceRunning)
     }
     override fun cancel() { cancels.incrementAndGet() }
+}
+
+/**
+ * WorkManager's unique-work policies over an in-memory queue (the JVM has no WorkManager): which
+ * request a trigger inserts, keeps or cancels. A test starts and finishes requests as WorkManager would.
+ */
+internal class FakeWorkManager {
+    enum class State { ENQUEUED, RUNNING, SUCCEEDED, CANCELLED }
+    class Work(val name: String, val request: WorkRequest) {
+        @Volatile var state = State.ENQUEUED
+        @Volatile var cancelledWhileRunning = false
+    }
+
+    private val works = Collections.synchronizedList(mutableListOf<Work>())
+    /** Every enqueue as "name:POLICY", including the ones the policy turns into a no-op. */
+    val calls: MutableList<String> = Collections.synchronizedList(mutableListOf())
+    private val operation = mockk<Operation>(relaxed = true)
+
+    val mock: WorkManager = mockk<WorkManager>(relaxed = true).also { wm ->
+        every { wm.enqueueUniqueWork(any<String>(), any<ExistingWorkPolicy>(), any<OneTimeWorkRequest>()) } answers {
+            enqueue(firstArg(), secondArg<ExistingWorkPolicy>().name, thirdArg())
+        }
+        every { wm.enqueueUniquePeriodicWork(any(), any(), any()) } answers {
+            enqueue(firstArg(), secondArg<ExistingPeriodicWorkPolicy>().name, thirdArg())
+        }
+        every { wm.cancelUniqueWork(any()) } answers { pending(firstArg()).forEach(::cancel); operation }
+    }
+
+    private fun enqueue(name: String, policy: String, request: WorkRequest): Operation {
+        calls.add("$name:$policy")
+        val pending = pending(name)
+        when (policy) {
+            // Cancels whatever holds the name, a request already running included.
+            "REPLACE", "CANCEL_AND_REENQUEUE" -> { pending.forEach(::cancel); works.add(Work(name, request)) }
+            // UPDATE changes a pending periodic request in place; a running period finishes first.
+            "KEEP", "UPDATE" -> if (pending.isEmpty()) works.add(Work(name, request))
+            // Chained behind the pending request, to run after it.
+            "APPEND", "APPEND_OR_REPLACE" -> works.add(Work(name, request))
+            else -> error("unmodelled policy $policy")
+        }
+        return operation
+    }
+
+    private fun cancel(work: Work) {
+        if (work.state == State.RUNNING) work.cancelledWhileRunning = true
+        work.state = State.CANCELLED
+    }
+
+    fun pending(name: String): List<Work> = synchronized(works) {
+        works.filter { it.name == name && (it.state == State.ENQUEUED || it.state == State.RUNNING) }
+    }
+    fun enqueues(name: String) = calls.count { it.startsWith("$name:") }
+    fun cancelledWhileRunning(): List<Work> = synchronized(works) { works.filter { it.cancelledWhileRunning } }
+
+    /** WorkManager starts the oldest request queued under [name]. */
+    fun start(name: String): Work = pending(name).first { it.state == State.ENQUEUED }.also { it.state = State.RUNNING }
+    fun finish(name: String) = pending(name).filter { it.state == State.RUNNING }.forEach { it.state = State.SUCCEEDED }
 }
 
 internal object TestDispatchers : DispatcherProvider {

@@ -5,6 +5,7 @@ import android.content.Context
 import android.util.Log
 import kotlinx.coroutines.*
 import java.lang.ref.WeakReference
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Controls which log messages the SDK emits.
@@ -120,6 +121,11 @@ class OpenWearablesHealthSDK private constructor(
     private var host: String? = null
     private var customSyncUrl: String? = null
 
+    // Gutsy fork (GUT-217) — the endpoint this instance (the process's singleton) last scheduled
+    // background sync for. configure() restores only when it differs: restoring on every call
+    // re-enqueued the work, and the app's 30-second health-read retry uploaded every 30 s (S23, 24 Oct).
+    private val backgroundSyncScheduledFor = AtomicReference<Pair<String, String?>?>(null)
+
     // Activity reference via WeakReference to prevent memory leaks
     private var activityRef: WeakReference<Activity>? = null
 
@@ -167,8 +173,13 @@ class OpenWearablesHealthSDK private constructor(
 
         val isSyncActive = secureStorage.isSyncActive() && secureStorage.hasSession()
         if (isSyncActive && storedTypes.isNotEmpty()) {
-            logMessage("Auto-restoring background sync...")
-            scope.launch { autoRestoreSync() }
+            val endpoint = host to this.customSyncUrl
+            if (backgroundSyncScheduledFor.getAndSet(endpoint) != endpoint) {
+                logMessage("Auto-restoring background sync...")
+                scope.launch { autoRestoreSync(endpoint) }
+            } else {
+                logMessage("Background sync already scheduled in this process")
+            }
         }
 
         return isSyncActive
@@ -194,13 +205,13 @@ class OpenWearablesHealthSDK private constructor(
         logMessage("Sync notification updated: title=${title ?: "(unchanged)"}, text=${text ?: "(unchanged)"}")
     }
 
-    private suspend fun autoRestoreSync() {
-        val h = host
-        if (h == null || secureStorage.getUserId() == null || !secureStorage.hasAuth) {
-            logMessage("Cannot auto-restore: no session or host")
+    private suspend fun autoRestoreSync(endpoint: Pair<String, String?>) {
+        if (secureStorage.getUserId() == null || !secureStorage.hasAuth) {
+            backgroundSyncScheduledFor.compareAndSet(endpoint, null) // nothing scheduled; the next configure() tries again
+            logMessage("Cannot auto-restore: no session")
             return
         }
-        ensureSyncManager().startBackgroundSync(h, customSyncUrl)
+        ensureSyncManager().startBackgroundSync(endpoint.first, endpoint.second)
         logMessage("Background sync auto-restored")
     }
 
@@ -246,6 +257,7 @@ class OpenWearablesHealthSDK private constructor(
         } finally {
             val sm = syncManager
             try { sm?.stopBackgroundSync() } catch (_: Exception) { logMessage("Periodic cancellation unconfirmed") }
+            backgroundSyncScheduledFor.set(null)
             try { sm?.resetAnchors(); sm?.clearSyncSession(); sm?.clearRetryState() } catch (_: Exception) { logMessage("Local sync cleanup unconfirmed") }
             try { activeProvider?.disconnect() } catch (_: Exception) { logMessage("Local provider cleanup unconfirmed") }
             activeProvider = null; syncManager = null
@@ -394,10 +406,12 @@ class OpenWearablesHealthSDK private constructor(
         secureStorage.setSyncActive(true)
         logMessage("Background sync started (${getOrCreateProvider().providerName})")
         ensureSyncManager().startBackgroundSync(h, customSyncUrl)
+        backgroundSyncScheduledFor.set(h to customSyncUrl)
     }
 
     suspend fun stopBackgroundSync() {
         ensureSyncManager().stopBackgroundSync()
+        backgroundSyncScheduledFor.set(null)
         secureStorage.setSyncActive(false)
         logMessage("Background sync stopped")
     }

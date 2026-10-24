@@ -36,6 +36,8 @@ internal class WorkManagerRetryScheduler(private val context: Context) : RetrySc
                 HealthSyncWorker.KEY_TRIGGER to SyncTrigger.RETRY
             ))
             .build()
+        // REPLACE only meets a retry still waiting out its delay (GUT-217, checked 24 Oct): a retry run
+        // holds SyncRunGate while it reads and uploads, so no other run reaches settle() meanwhile.
         val policy = if (replaceRunning) ExistingWorkPolicy.REPLACE else ExistingWorkPolicy.APPEND_OR_REPLACE
         WorkManager.getInstance(context).enqueueUniqueWork(SyncDefaults.WORK_NAME_RETRY, policy, work)
     }
